@@ -1,6 +1,7 @@
 #include "autocloud_scan.h"
 #include "autocloud_util.h"
 #include "file_util.h"
+#include "json.h"
 #include "log.h"
 #include "steam_root_ids.h"
 #include "vdf.h"
@@ -337,8 +338,8 @@ static AutoCloudEffectivePlatform DetectEffectivePlatform(const std::string& ste
 #endif
 }
 
-static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& steamPath, uint32_t appId,
-                                                           AutoCloudEffectivePlatform effectivePlatform) {
+static std::vector<AutoCloudRuleNative> LoadAutoCloudRulesFromAppInfo(const std::string& steamPath, uint32_t appId,
+                                                                      AutoCloudEffectivePlatform effectivePlatform) {
     std::vector<AutoCloudRuleNative> rules;
 
     // Cache key includes effective platform so Proton vs native don't collide
@@ -574,6 +575,78 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
     }
 
     cacheRules(rules);
+    return rules;
+}
+
+// Rules the user added for games whose appinfo.vdf entry has no savefiles rule (or loses it
+// when Steam rewrites the file). They live in
+// %LOCALAPPDATA%\CloudRedirect\added-rules.json ({"<appid>": {root,path,pattern,recursive}}),
+// which the CloudRedirect UI writes.
+// Only consulted when appinfo.vdf yields no savefiles rules for the app, so a rule
+// published by the developer always wins.
+static std::vector<AutoCloudRuleNative> LoadRulesFromFile(const std::filesystem::path& file, uint32_t appId) {
+    std::vector<AutoCloudRuleNative> rules;
+#ifdef _WIN32
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return rules;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    try {
+        Json::Value root = Json::Parse(ss.str());
+        const std::string key = std::to_string(appId);
+        if (root.type != Json::Type::Object || !root.has(key)) return rules;
+        const Json::Value& entry = root[key];
+        if (entry.type != Json::Type::Object || !entry.has("root") || !entry.has("path")) return rules;
+        AutoCloudRuleNative rule;
+        rule.root = entry["root"].str();
+        rule.cloudRoot = rule.root;
+        rule.path = entry["path"].str();
+        rule.resolvedPath = rule.path;
+        rule.pattern = entry.has("pattern") && !entry["pattern"].str().empty() ? entry["pattern"].str() : "*";
+        rule.recursive = entry.has("recursive") && entry["recursive"].boolean();
+        if (rule.root.empty()) return rules;
+        rules.push_back(std::move(rule));
+    } catch (...) {
+        return {};
+    }
+#else
+    (void)file;
+    (void)appId;
+#endif
+    return rules;
+}
+
+static std::vector<AutoCloudRuleNative> LoadUserRules(uint32_t appId) {
+    std::vector<AutoCloudRuleNative> rules;
+#ifdef _WIN32
+    char base[MAX_PATH] = {0};
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base));
+    if (n == 0 || n >= sizeof(base)) return rules;
+    const std::filesystem::path local = FileUtil::Utf8ToPath(base);
+    rules = LoadRulesFromFile(local / "CloudRedirect" / "added-rules.json", appId);
+#else
+    (void)appId;
+#endif
+    return rules;
+}
+
+static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& steamPath, uint32_t appId,
+                                                           AutoCloudEffectivePlatform effectivePlatform) {
+    auto rules = LoadAutoCloudRulesFromAppInfo(steamPath, appId, effectivePlatform);
+    if (!rules.empty()) return rules;
+
+    rules = LoadUserRules(appId);
+    if (!rules.empty()) {
+        static std::mutex logMutex;
+        static std::unordered_set<uint32_t> logged;
+        std::lock_guard<std::mutex> lock(logMutex);
+        if (logged.insert(appId).second) {
+            LOG("LoadAutoCloudRules: app %u has no savefiles rule in appinfo.vdf; using user rule "
+                "root='%s' path='%s' pattern='%s' recursive=%d",
+                appId, rules[0].root.c_str(), rules[0].path.c_str(), rules[0].pattern.c_str(),
+                rules[0].recursive ? 1 : 0);
+        }
+    }
     return rules;
 }
 

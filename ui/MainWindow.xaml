@@ -107,6 +107,14 @@
                                         Icon="{ui:SymbolIcon Apps24}"
                                         Content="{res:Loc Nav_Apps}"
                                         TargetPageType="{x:Type pages:AppsPage}" />
+                <ui:NavigationViewItem x:Name="NavCloudStatus"
+                                        Icon="{ui:SymbolIcon HeartPulse24}"
+                                        Content="{res:Loc Nav_CloudStatus}"
+                                        TargetPageType="{x:Type pages:CloudStatusPage}" />
+                <ui:NavigationViewItem x:Name="NavSaveRules"
+                                        Icon="{ui:SymbolIcon DocumentSave24}"
+                                        Content="{res:Loc Nav_SaveRules}"
+                                        TargetPageType="{x:Type pages:SaveRulesPage}" />
                 <ui:NavigationViewItem x:Name="NavCleanup"
                                          Icon="{ui:SymbolIcon Delete24}"
                                          Content="{res:Loc Nav_Cleanup}"

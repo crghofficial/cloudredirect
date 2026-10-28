@@ -1955,4 +1955,224 @@ Tem certeza?</value>
     <value>Escaneando provedor de origem...</value>
   </data>
 
+  <data name="Nav_CloudStatus" xml:space="preserve">
+    <value>Status da nuvem</value>
+  </data>
+  <data name="Nav_SaveRules" xml:space="preserve">
+    <value>Regras de save</value>
+  </data>
+  <data name="Status_Title" xml:space="preserve">
+    <value>Status da nuvem</value>
+  </data>
+  <data name="Status_Refresh" xml:space="preserve">
+    <value>Atualizar</value>
+  </data>
+  <data name="Status_Health" xml:space="preserve">
+    <value>Saúde do CloudRedirect</value>
+  </data>
+  <data name="Status_Loading" xml:space="preserve">
+    <value>Lendo logs…</value>
+  </data>
+  <data name="Status_Games" xml:space="preserve">
+    <value>Jogos gerenciados</value>
+  </data>
+  <data name="Status_NoSteam" xml:space="preserve">
+    <value>Instalação da Steam não encontrada.</value>
+  </data>
+  <data name="Status_NoGames" xml:space="preserve">
+    <value>Nenhum jogo gerenciado no log do CloudRedirect ainda.</value>
+  </data>
+  <data name="Status_NoLog" xml:space="preserve">
+    <value>cloud_redirect.log não encontrado. Abra a Steam uma vez com o CloudRedirect instalado.</value>
+  </data>
+  <data name="Status_ResolverFailed" xml:space="preserve">
+    <value>Esta versão da Steam não foi reconhecida; o CloudRedirect não consegue registrar as regras de save.</value>
+  </data>
+  <data name="Status_HooksFailed" xml:space="preserve">
+    <value>Os ganchos do CloudRedirect não ficaram ativos nesta sessão.</value>
+  </data>
+  <data name="Status_NoSession" xml:space="preserve">
+    <value>Ainda não há uma sessão do CloudRedirect registrada no log.</value>
+  </data>
+  <data name="Status_ResolverPartial" xml:space="preserve">
+    <value>Carregado, com injetor e ganchos ativos. {0} endereços internos não foram resolvidos (o log não indica impacto).</value>
+  </data>
+  <data name="Status_AllGood" xml:space="preserve">
+    <value>CloudRedirect carregado e reconhecendo esta versão da Steam.</value>
+  </data>
+  <data name="Status_Session" xml:space="preserve">
+    <value>sessão {0}</value>
+  </data>
+  <data name="Status_SteamOpen" xml:space="preserve">
+    <value>Steam aberta</value>
+  </data>
+  <data name="Status_SteamClosed" xml:space="preserve">
+    <value>Steam fechada</value>
+  </data>
+  <data name="Status_RuleMissing" xml:space="preserve">
+    <value>A última saída não vigiou nenhum arquivo, mas a nuvem tem arquivos: provavelmente falta a regra de save (veja Regras de save).</value>
+  </data>
+  <data name="Status_NoSyncYet" xml:space="preserve">
+    <value>Nenhum sync registrado no log de nuvem da Steam ainda.</value>
+  </data>
+  <data name="Status_KindLaunch" xml:space="preserve">
+    <value>ao abrir</value>
+  </data>
+  <data name="Status_KindExit" xml:space="preserve">
+    <value>ao sair</value>
+  </data>
+  <data name="Status_KindOther" xml:space="preserve">
+    <value>em segundo plano</value>
+  </data>
+  <data name="Status_ResultSlow" xml:space="preserve">
+    <value>LENTO</value>
+  </data>
+  <data name="Status_ResultFailed" xml:space="preserve">
+    <value>ERRO</value>
+  </data>
+  <data name="Status_ResultNone" xml:space="preserve">
+    <value>SEM RESULTADO</value>
+  </data>
+  <data name="Status_Watching" xml:space="preserve">
+    <value>Vigiando {0} arquivos</value>
+  </data>
+  <data name="Status_WatchingUnknown" xml:space="preserve">
+    <value>Arquivos vigiados desconhecidos</value>
+  </data>
+  <data name="Status_CloudState" xml:space="preserve">
+    <value>nuvem CN {0}, {1} arquivos</value>
+  </data>
+  <data name="Status_CloudUnknown" xml:space="preserve">
+    <value>estado da nuvem desconhecido</value>
+  </data>
+  <data name="Status_JustNow" xml:space="preserve">
+    <value>agora há pouco</value>
+  </data>
+  <data name="Status_MinutesAgo" xml:space="preserve">
+    <value>há {0} min</value>
+  </data>
+  <data name="Status_HoursAgo" xml:space="preserve">
+    <value>há {0} h</value>
+  </data>
+  <data name="Status_DaysAgo" xml:space="preserve">
+    <value>há {0} d</value>
+  </data>
+  <data name="Rules_Title" xml:space="preserve">
+    <value>Regras de save</value>
+  </data>
+  <data name="Rules_Description" xml:space="preserve">
+    <value>Adicione a pasta de saves de um jogo que a Steam não lista, para o CloudRedirect sincronizar. A regra é gravada no appinfo.vdf da Steam (com backup) e só com a Steam fechada.</value>
+  </data>
+  <data name="Rules_SteamState" xml:space="preserve">
+    <value>Steam</value>
+  </data>
+  <data name="Rules_SteamOpen" xml:space="preserve">
+    <value>A Steam está aberta. Uma regra salva é usada na próxima sincronização do jogo; não precisa reiniciar.</value>
+  </data>
+  <data name="Rules_SteamClosed" xml:space="preserve">
+    <value>A Steam está fechada. Uma regra salva é usada assim que a Steam iniciar.</value>
+  </data>
+  <data name="Rules_Game" xml:space="preserve">
+    <value>Jogo</value>
+  </data>
+  <data name="Rules_Folder" xml:space="preserve">
+    <value>Pasta dos saves</value>
+  </data>
+  <data name="Rules_Choose" xml:space="preserve">
+    <value>Escolher…</value>
+  </data>
+  <data name="Rules_NoFolder" xml:space="preserve">
+    <value>Nenhuma pasta escolhida</value>
+  </data>
+  <data name="Rules_Pattern" xml:space="preserve">
+    <value>Arquivos</value>
+  </data>
+  <data name="Rules_Recursive" xml:space="preserve">
+    <value>Incluir subpastas</value>
+  </data>
+  <data name="Rules_Preview" xml:space="preserve">
+    <value>Regra que será gravada</value>
+  </data>
+  <data name="Rules_CopySaves" xml:space="preserve">
+    <value>Copiar saves (backup)</value>
+  </data>
+  <data name="Rules_Write" xml:space="preserve">
+    <value>Gravar regra</value>
+  </data>
+  <data name="Rules_RestoreTitle" xml:space="preserve">
+    <value>Restaurar uma lista de regras anterior</value>
+  </data>
+  <data name="Rules_Restore" xml:space="preserve">
+    <value>Restaurar</value>
+  </data>
+  <data name="Rules_PickGameFirst" xml:space="preserve">
+    <value>Escolha um jogo primeiro.</value>
+  </data>
+  <data name="Rules_ChooseTitle" xml:space="preserve">
+    <value>Pasta dos saves de {0}</value>
+  </data>
+  <data name="Rules_FolderOutside" xml:space="preserve">
+    <value>Escolha uma pasta dentro de Documentos, AppData, Saved Games, ProgramData, da pasta do usuário ou da instalação do jogo.</value>
+  </data>
+  <data name="Rules_ForeignRules" xml:space="preserve">
+    <value>Este jogo já tem {0} regra(s) Auto-Cloud publicada(s) pelo desenvolvedor; elas têm prioridade, então salvar fica desabilitado.</value>
+  </data>
+  <data name="Rules_OwnRule" xml:space="preserve">
+    <value>Regra atual: {0}</value>
+  </data>
+  <data name="Rules_NoRules" xml:space="preserve">
+    <value>Este jogo não tem regras Auto-Cloud.</value>
+  </data>
+  <data name="Rules_PickToPreview" xml:space="preserve">
+    <value>Escolha um jogo e uma pasta para ver a regra.</value>
+  </data>
+  <data name="Rules_PlusSubfolders" xml:space="preserve">
+    <value> + subpastas</value>
+  </data>
+  <data name="Rules_Reading" xml:space="preserve">
+    <value>Lendo a pasta…</value>
+  </data>
+  <data name="Rules_NoMatch" xml:space="preserve">
+    <value>Nenhum arquivo corresponde ao padrão: a regra não sincronizaria nada.</value>
+  </data>
+  <data name="Rules_Stats" xml:space="preserve">
+    <value>{0} arquivos · {1}</value>
+  </data>
+  <data name="Rules_BackedUp" xml:space="preserve">
+    <value>{0} arquivos ({1}) copiados para {2}</value>
+  </data>
+  <data name="Rules_CloseSteam" xml:space="preserve">
+    <value>Feche a Steam por completo primeiro.</value>
+  </data>
+  <data name="Rules_ConfirmWrite" xml:space="preserve">
+    <value>Gravar esta regra de save para {0}?
+
+{1}
+
+A Steam precisa continuar fechada. Antes é feito um backup do appinfo.vdf.</value>
+  </data>
+  <data name="Rules_Written" xml:space="preserve">
+    <value>Regra salva. Abra o jogo; o log da nuvem deve mostrar "using CloudRedirect rule" e depois "Watching" com contagem maior que zero.</value>
+  </data>
+  <data name="Rules_ConfirmRestore" xml:space="preserve">
+    <value>Restaurar o backup de regras "{0}"? Isso substitui sua lista atual de regras adicionadas.</value>
+  </data>
+  <data name="Rules_Restored" xml:space="preserve">
+    <value>Backup restaurado.</value>
+  </data>
+  <data name="Rules_Suggestions" xml:space="preserve">
+    <value>Locais de save detectados</value>
+  </data>
+  <data name="Rules_SuggestSearching" xml:space="preserve">
+    <value>Procurando as pastas de save deste jogo…</value>
+  </data>
+  <data name="Rules_SuggestFound" xml:space="preserve">
+    <value>{0} local(is) encontrado(s) neste PC; o primeiro já está selecionado. Escolha outro ou escolha a pasta você mesmo. O + indica que as subpastas entram; o ~ indica que a pasta foi achada pelo nome.</value>
+  </data>
+  <data name="Rules_SuggestNone" xml:space="preserve">
+    <value>Nenhum local de save conhecido existe neste PC para este jogo. Escolha a pasta você mesmo.</value>
+  </data>
+  <data name="Rules_SuggestFailed" xml:space="preserve">
+    <value>Não foi possível carregar a lista de locais de save: {0}</value>
+  </data>
 </root>

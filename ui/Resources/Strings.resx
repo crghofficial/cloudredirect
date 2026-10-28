@@ -2003,4 +2003,224 @@ Are you sure?</value>
     <value>Scanning source provider...</value>
   </data>
 
+  <data name="Nav_CloudStatus" xml:space="preserve">
+    <value>Cloud Status</value>
+  </data>
+  <data name="Nav_SaveRules" xml:space="preserve">
+    <value>Save Rules</value>
+  </data>
+  <data name="Status_Title" xml:space="preserve">
+    <value>Cloud Status</value>
+  </data>
+  <data name="Status_Refresh" xml:space="preserve">
+    <value>Refresh</value>
+  </data>
+  <data name="Status_Health" xml:space="preserve">
+    <value>CloudRedirect health</value>
+  </data>
+  <data name="Status_Loading" xml:space="preserve">
+    <value>Reading logs…</value>
+  </data>
+  <data name="Status_Games" xml:space="preserve">
+    <value>Managed games</value>
+  </data>
+  <data name="Status_NoSteam" xml:space="preserve">
+    <value>Steam installation not found.</value>
+  </data>
+  <data name="Status_NoGames" xml:space="preserve">
+    <value>No managed games found in the CloudRedirect log yet.</value>
+  </data>
+  <data name="Status_NoLog" xml:space="preserve">
+    <value>No cloud_redirect.log found. Open Steam once with CloudRedirect installed.</value>
+  </data>
+  <data name="Status_ResolverFailed" xml:space="preserve">
+    <value>This Steam version was not recognised; CloudRedirect cannot register save rules.</value>
+  </data>
+  <data name="Status_HooksFailed" xml:space="preserve">
+    <value>The CloudRedirect hooks did not become active in this session.</value>
+  </data>
+  <data name="Status_NoSession" xml:space="preserve">
+    <value>No CloudRedirect session is recorded in the log yet.</value>
+  </data>
+  <data name="Status_ResolverPartial" xml:space="preserve">
+    <value>Loaded, with injector and hooks active. {0} internal addresses were not resolved (the log does not say whether this has any impact).</value>
+  </data>
+  <data name="Status_AllGood" xml:space="preserve">
+    <value>CloudRedirect is loaded and recognises this Steam version.</value>
+  </data>
+  <data name="Status_Session" xml:space="preserve">
+    <value>session {0}</value>
+  </data>
+  <data name="Status_SteamOpen" xml:space="preserve">
+    <value>Steam is open</value>
+  </data>
+  <data name="Status_SteamClosed" xml:space="preserve">
+    <value>Steam is closed</value>
+  </data>
+  <data name="Status_RuleMissing" xml:space="preserve">
+    <value>The last exit watched no files although the cloud has some: the save rule is probably missing (see Save Rules).</value>
+  </data>
+  <data name="Status_NoSyncYet" xml:space="preserve">
+    <value>No sync recorded in Steam's cloud log yet.</value>
+  </data>
+  <data name="Status_KindLaunch" xml:space="preserve">
+    <value>on launch</value>
+  </data>
+  <data name="Status_KindExit" xml:space="preserve">
+    <value>on exit</value>
+  </data>
+  <data name="Status_KindOther" xml:space="preserve">
+    <value>background</value>
+  </data>
+  <data name="Status_ResultSlow" xml:space="preserve">
+    <value>SLOW</value>
+  </data>
+  <data name="Status_ResultFailed" xml:space="preserve">
+    <value>FAILED</value>
+  </data>
+  <data name="Status_ResultNone" xml:space="preserve">
+    <value>NO RESULT</value>
+  </data>
+  <data name="Status_Watching" xml:space="preserve">
+    <value>Watching {0} files</value>
+  </data>
+  <data name="Status_WatchingUnknown" xml:space="preserve">
+    <value>Watched files unknown</value>
+  </data>
+  <data name="Status_CloudState" xml:space="preserve">
+    <value>cloud CN {0}, {1} files</value>
+  </data>
+  <data name="Status_CloudUnknown" xml:space="preserve">
+    <value>cloud state unknown</value>
+  </data>
+  <data name="Status_JustNow" xml:space="preserve">
+    <value>just now</value>
+  </data>
+  <data name="Status_MinutesAgo" xml:space="preserve">
+    <value>{0} min ago</value>
+  </data>
+  <data name="Status_HoursAgo" xml:space="preserve">
+    <value>{0} h ago</value>
+  </data>
+  <data name="Status_DaysAgo" xml:space="preserve">
+    <value>{0} d ago</value>
+  </data>
+  <data name="Rules_Title" xml:space="preserve">
+    <value>Save Rules</value>
+  </data>
+  <data name="Rules_Description" xml:space="preserve">
+    <value>Add the save folder of a game that Steam does not list, so CloudRedirect syncs it. The rule is written to Steam's appinfo.vdf (with a backup) and only while Steam is closed.</value>
+  </data>
+  <data name="Rules_SteamState" xml:space="preserve">
+    <value>Steam</value>
+  </data>
+  <data name="Rules_SteamOpen" xml:space="preserve">
+    <value>Steam is open. A saved rule is picked up the next time the game syncs; no restart is needed.</value>
+  </data>
+  <data name="Rules_SteamClosed" xml:space="preserve">
+    <value>Steam is closed. A saved rule is used as soon as Steam starts.</value>
+  </data>
+  <data name="Rules_Game" xml:space="preserve">
+    <value>Game</value>
+  </data>
+  <data name="Rules_Folder" xml:space="preserve">
+    <value>Save folder</value>
+  </data>
+  <data name="Rules_Choose" xml:space="preserve">
+    <value>Choose…</value>
+  </data>
+  <data name="Rules_NoFolder" xml:space="preserve">
+    <value>No folder chosen</value>
+  </data>
+  <data name="Rules_Pattern" xml:space="preserve">
+    <value>Files</value>
+  </data>
+  <data name="Rules_Recursive" xml:space="preserve">
+    <value>Include subfolders</value>
+  </data>
+  <data name="Rules_Preview" xml:space="preserve">
+    <value>Rule to be written</value>
+  </data>
+  <data name="Rules_CopySaves" xml:space="preserve">
+    <value>Copy saves (backup)</value>
+  </data>
+  <data name="Rules_Write" xml:space="preserve">
+    <value>Write rule</value>
+  </data>
+  <data name="Rules_RestoreTitle" xml:space="preserve">
+    <value>Restore a previous list of rules</value>
+  </data>
+  <data name="Rules_Restore" xml:space="preserve">
+    <value>Restore</value>
+  </data>
+  <data name="Rules_PickGameFirst" xml:space="preserve">
+    <value>Choose a game first.</value>
+  </data>
+  <data name="Rules_ChooseTitle" xml:space="preserve">
+    <value>Save folder of {0}</value>
+  </data>
+  <data name="Rules_FolderOutside" xml:space="preserve">
+    <value>Choose a folder inside Documents, AppData, Saved Games, ProgramData, the user folder or the game install folder.</value>
+  </data>
+  <data name="Rules_ForeignRules" xml:space="preserve">
+    <value>This game already has {0} Auto-Cloud rule(s) published by its developer; they take priority, so saving is disabled.</value>
+  </data>
+  <data name="Rules_OwnRule" xml:space="preserve">
+    <value>Current rule: {0}</value>
+  </data>
+  <data name="Rules_NoRules" xml:space="preserve">
+    <value>No Auto-Cloud rules for this game.</value>
+  </data>
+  <data name="Rules_PickToPreview" xml:space="preserve">
+    <value>Choose a game and a folder to see the rule.</value>
+  </data>
+  <data name="Rules_PlusSubfolders" xml:space="preserve">
+    <value> + subfolders</value>
+  </data>
+  <data name="Rules_Reading" xml:space="preserve">
+    <value>Reading folder…</value>
+  </data>
+  <data name="Rules_NoMatch" xml:space="preserve">
+    <value>No file matches the pattern: the rule would sync nothing.</value>
+  </data>
+  <data name="Rules_Stats" xml:space="preserve">
+    <value>{0} files · {1}</value>
+  </data>
+  <data name="Rules_BackedUp" xml:space="preserve">
+    <value>Copied {0} files ({1}) to {2}</value>
+  </data>
+  <data name="Rules_CloseSteam" xml:space="preserve">
+    <value>Close Steam completely first.</value>
+  </data>
+  <data name="Rules_ConfirmWrite" xml:space="preserve">
+    <value>Write this save rule for {0}?
+
+{1}
+
+Steam must stay closed. A backup of appinfo.vdf is made first.</value>
+  </data>
+  <data name="Rules_Written" xml:space="preserve">
+    <value>Rule saved. Open the game; the cloud log should say "using CloudRedirect rule" and then "Watching" with a non-zero count.</value>
+  </data>
+  <data name="Rules_ConfirmRestore" xml:space="preserve">
+    <value>Restore the rules backup "{0}"? This replaces your current list of added rules.</value>
+  </data>
+  <data name="Rules_Restored" xml:space="preserve">
+    <value>Backup restored.</value>
+  </data>
+  <data name="Rules_Suggestions" xml:space="preserve">
+    <value>Detected save locations</value>
+  </data>
+  <data name="Rules_SuggestSearching" xml:space="preserve">
+    <value>Looking for this game's save folders…</value>
+  </data>
+  <data name="Rules_SuggestFound" xml:space="preserve">
+    <value>{0} location(s) found on this PC and the first one is selected. Pick another or choose the folder yourself. A + means subfolders are included; ~ means it was found by folder name.</value>
+  </data>
+  <data name="Rules_SuggestNone" xml:space="preserve">
+    <value>No known save location exists on this PC for this game. Choose the folder yourself.</value>
+  </data>
+  <data name="Rules_SuggestFailed" xml:space="preserve">
+    <value>Could not load the list of save locations: {0}</value>
+  </data>
 </root>

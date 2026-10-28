@@ -94,57 +94,122 @@ static uintptr_t ResolveServiceTransportVtable() {
 }
 
 // ── Global engine pointer ─────────────────────────────────────────────
-// Approach: FlushAppMinutesPlayed at +0x09 loads g_pCSteamEngine via
-// `mov rax, cs:[rip+disp]`. We can also scan for `lea rcx/rbx, [reg+0xE68]`
-// (CAppInfoCache offset) and backwalk to the preceding mov from global.
-// The CAppInfoCache approach is more generic and doesn't depend on any
-// single function existing.
+// The CAppInfoCache offset inside CSteamEngine moves between Steam builds
+// (0xE68 on 1788652215, 0x1208 on 1792618285), so it is not hardcoded.
+//   1. Every `call GetAppInfo` is preceded by `lea rcx, [reg+off]` (this =
+//      engine+off). The most common `off` among those call sites is the offset.
+//   2. Every `lea reg, [reg+off]` in .text is preceded by `mov reg, [rip+g]`
+//      loading g_pCSteamEngine. The most common `g` in .data is the global.
+// Both steps are majority votes with minimum thresholds; if either is
+// ambiguous the resolver reports failure rather than guessing.
 
-static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
-    // Strategy A: scan for `lea rcx, [reg+0xE68]` pattern (CAppInfoCache offset)
-    // Pattern bytes: 48 8D 89 68 0E 00 00 (lea rcx,[rcx+0xE68])
-    //           or:  48 8D 8B 68 0E 00 00 (lea rcx,[rbx+0xE68])
-    // ModR/M byte 89=rcx+rcx, 8B=rcx+rbx, 8F=rcx+rdi, 8E=rcx+rsi
-    // We use wildcard on the ModR/M to catch any source register:
-    //   48 8D ?? 68 0E 00 00  where byte[2] & 0xC7 == 0x81 (disp32 + base reg)
-    // Actually simpler: the 4-byte immediate 68 0E 00 00 (=0xE68) is distinctive.
+static uintptr_t ResolveGetAppInfo();
 
-    // Scan for any `lea reg, [reg + 0x00000E68]` -- 7-byte form with disp32
-    // The full pattern is: REX 8D ModRM disp32
-    // REX = 48 or 4C; opcode = 8D; ModRM & 0xC0 == 0x80 (mod=10 = disp32)
-    // and disp = 0x00000E68.
-    const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
-    size_t textSize = SigScanner::GetTextSize();
+static constexpr int kMinVotes = 3;
 
+// Fixed-size vote tally (no destructors, so it can live in __try functions).
+struct VoteTally {
+    static constexpr int kSlots = 16;
+    uintptr_t key[kSlots] = {};
+    int       count[kSlots] = {};
+    int       used = 0;
+    int       total = 0;
+
+    void Add(uintptr_t k) {
+        ++total;
+        for (int i = 0; i < used; ++i)
+            if (key[i] == k) { ++count[i]; return; }
+        if (used < kSlots) { key[used] = k; count[used++] = 1; }
+    }
+    int Best(uintptr_t& outKey) const {
+        int best = 0;
+        for (int i = 0; i < used; ++i)
+            if (count[i] > best) { best = count[i]; outKey = key[i]; }
+        return best;
+    }
+};
+
+static uintptr_t ResolveGlobalEngine(uintptr_t scBase, uintptr_t getAppInfoAddr,
+                                     uint32_t& outCacheOffset) {
+    outCacheOffset = 0;
+    if (!getAppInfoAddr) {
+        LOG("[Resolver] GlobalEngine: GetAppInfo unresolved, cannot derive CAppInfoCache offset");
+        return 0;
+    }
+
+    const uintptr_t textBase = SigScanner::GetTextBase();
+    const auto* text = reinterpret_cast<const uint8_t*>(textBase);
+    const size_t textSize = SigScanner::GetTextSize();
+
+    // Step 1: CAppInfoCache offset from `lea rcx,[reg+disp32]; call GetAppInfo`.
+    uint32_t offset = 0;
+    {
+        VoteTally votes;
+        int calls = 0;
+        __try {
+            for (size_t i = 7; i + 5 <= textSize; ++i) {
+                if (text[i] != 0xE8) continue;
+                int32_t rel = *reinterpret_cast<const int32_t*>(text + i + 1);
+                if (textBase + i + 5 + rel != getAppInfoAddr) continue;
+                ++calls;
+                const uint8_t* l = text + i - 7;
+                // REX.W (+B) 8D, ModRM mod=10 reg=rcx, disp32
+                if ((l[0] == 0x48 || l[0] == 0x49) && l[1] == 0x8D && (l[2] & 0xF8) == 0x88) {
+                    int32_t d = *reinterpret_cast<const int32_t*>(l + 3);
+                    if (d > 0) votes.Add((uintptr_t)d);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        uintptr_t bestOff = 0;
+        int best = votes.Best(bestOff);
+        if (best < kMinVotes || best * 2 < votes.total) {
+            LOG("[Resolver] GlobalEngine: ambiguous CAppInfoCache offset "
+                "(calls=%d, lea votes=%d, best=%d)", calls, votes.total, best);
+            return 0;
+        }
+        offset = (uint32_t)bestOff;
+        LOG("[Resolver] CAppInfoCache offset 0x%X via GetAppInfo callers (%d/%d lea votes, %d calls)",
+            offset, best, votes.total, calls);
+    }
+
+    // Step 2: engine global from `mov reg,[rip+g]; ...; lea reg,[reg+offset]`.
+    VoteTally globals;
+    int sites = 0;
     __try {
         for (size_t i = 0; i + 7 <= textSize; ++i) {
-            if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
-                (text[i+2] & 0xC0) == 0x80) {
-                // Check disp32 == 0xE68
-                int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
-                if (disp != 0xE68) continue;
+            if ((text[i] != 0x48 && text[i] != 0x4C) || text[i+1] != 0x8D ||
+                (text[i+2] & 0xC0) != 0x80)
+                continue;
+            if (*reinterpret_cast<const int32_t*>(text + i + 3) != (int32_t)offset) continue;
+            ++sites;
 
-                uintptr_t leaAddr = SigScanner::GetTextBase() + i;
-
-                // Walk backward up to 40 bytes looking for `mov reg, [rip+disp]`
-                for (int back = 7; back <= 40; ++back) {
-                    uintptr_t candidate = leaAddr - back;
-                    if (candidate < SigScanner::GetTextBase()) break;
-                    uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
-                    if (global && global >= SigScanner::GetDataBase() &&
-                        global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
-                        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0xE68 backwalk",
-                            (void*)global, (uint64_t)(global - scBase));
-                        return global;
-                    }
+            uintptr_t leaAddr = textBase + i;
+            for (int back = 7; back <= 40; ++back) {
+                uintptr_t candidate = leaAddr - back;
+                if (candidate < textBase) break;
+                uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
+                if (global && global >= SigScanner::GetDataBase() &&
+                    global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
+                    globals.Add(global);
+                    break;
                 }
-                // Try next lea+0xE68 occurrence if backwalk failed
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-    LOG("[Resolver] GlobalEngine: all strategies failed");
-    return 0;
+    uintptr_t bestGlobal = 0;
+    int best = globals.Best(bestGlobal);
+    if (best < kMinVotes || best * 3 < globals.total * 2) {
+        LOG("[Resolver] GlobalEngine: ambiguous global for lea+0x%X "
+            "(sites=%d, resolved=%d, best=%d)", offset, sites, globals.total, best);
+        return 0;
+    }
+
+    outCacheOffset = offset;
+    LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0x%X backwalk (%d/%d sites)",
+        (void*)bestGlobal, (uint64_t)(bestGlobal - scBase), offset, best, sites);
+    return bestGlobal;
 }
 
 // ── Protobuf helpers ──────────────────────────────────────────────────
@@ -605,8 +670,9 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.ccmInterfaceVtable = ResolveCCMInterfaceVtable();
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
-    // Phase 2: Global engine pointer
-    r.globalEngine = ResolveGlobalEngine(steamClientBase);
+    // Phase 2: Global engine pointer (needs GetAppInfo to derive the CAppInfoCache offset)
+    r.getAppInfo   = ResolveGetAppInfo();
+    r.globalEngine = ResolveGlobalEngine(steamClientBase, r.getAppInfo, r.engineOffAppInfoCache);
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -684,7 +750,7 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.kvSetString  = ResolveKvSetString();
 
     // Phase 9: AppInfo functions (signature-based, ReadConfigU64 anchored to GetAppInfo)
-    r.getAppInfo     = ResolveGetAppInfo();
+    // getAppInfo was resolved in phase 2 (global engine derivation depends on it).
     r.getSection     = ResolveGetSection();
     r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo);
 
@@ -1013,7 +1079,7 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.engineOffUserMap      = 0;
     r.ccmOffConnContext     = 0;
     r.userOffCcmInterface   = 0;
-    r.engineOffAppInfoCache = 0xE68;
+    // engineOffAppInfoCache is derived in phase 2; 0 means unresolved (no hardcoded fallback).
 
     LOG("[Resolver] === Auto-resolution complete ===");
     return r;

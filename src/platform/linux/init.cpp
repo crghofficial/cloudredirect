@@ -189,6 +189,11 @@ static void DoInit()
     }
     Log::Info("steamclient.so base=%p size=0x%zx", (void*)steamBase, steamSize);
 
+    // The steamrt64 bootstrap execs Steam again inside pressure-vessel. Do not
+    // strip the preload in that launcher; only the process that loads the real
+    // steamclient may stop passing it to children.
+    CleanLdPreload();
+
     DebugLog("[CR] DoInit: finding transport vtable\n");
     void** vtable = VtableHook::FindTransportVtable(steamBase, steamSize);
     if (!vtable)
@@ -200,6 +205,21 @@ static void DoInit()
     }
     Log::Info("Transport vtable at %p, slots: [5]=%p [7]=%p [8]=%p",
               (void*)vtable, vtable[5], vtable[7], vtable[8]);
+
+    // Resolve every mandatory ABI-dependent operation before modifying Steam.
+    // A partial port must not report success or intercept RPCs it cannot decode.
+    bool pbOk = CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
+#if defined(__x86_64__)
+    if (!pbOk || !SteamKvInjector::Init()) {
+        Log::Error("Init failed: required protobuf/KV ABI could not be resolved; no hooks installed");
+        Notify("Incompatible Steam client - hooks disabled", true);
+        return;
+    }
+
+#else
+    if (!pbOk)
+        Log::Error("Protobuf helpers not fully resolved -- cloud RPCs may fail");
+#endif
 
     DebugLog("[CR] DoInit: saving originals\n");
     CloudHooks::SetOriginals(vtable[5], vtable[7], vtable[8]);
@@ -228,11 +248,6 @@ static void DoInit()
     else
         Log::Warn("CUserRemoteStorage vtable not found (cloud toggle may not work)");
 
-    DebugLog("[CR] DoInit: resolving protobuf helpers\n");
-    bool pbOk = CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
-    if (!pbOk)
-        Log::Error("Protobuf helpers not fully resolved -- cloud RPCs may fail");
-
     // Observe outbound CMsgClientGamesPlayed to track namespace-app playtime.
     // Skipped entirely when stats_sync_enabled=false in config.json -- avoids
     // patching steamclient.so when the user doesn't want stats/achievements.
@@ -252,12 +267,13 @@ static void DoInit()
             LegacyMetadataCleanup::PruneSteamUserdata(steamPath);
     }
 
-    DebugLog("[CR] DoInit: initializing KV injector\n");
+#if !defined(__x86_64__)
     SteamKvInjector::Init();
+#endif
 
     g_initialized.store(true, std::memory_order_release);
     DebugLog("[CR] DoInit: SUCCESS\n");
-    Log::Info("CloudRedirect initialized successfully (all hooks active)");
+    Log::Info("CloudRedirect initialized successfully (cloud save hooks active; optional observers reported above)");
     Notify("Loaded successfully");
 }
 
@@ -543,6 +559,11 @@ static void* DeferredInitThread(void*)
         if (SteamclientMapped()) break;
         usleep(500000);
     }
+    if (!SteamclientMapped()) {
+        DebugLog("[CR] DeferredInit: launcher process has no steamclient; leaving preload for runtime child\n");
+        g_initThreadDone.store(true, std::memory_order_release);
+        return nullptr;
+    }
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -583,9 +604,6 @@ static void OnLoad()
     std::string proc = GetProcessName();
     if (proc != "steam" && !SteamclientMapped())
         return;
-
-    // Clean ourselves from LD_PRELOAD so child processes don't inherit us
-    CleanLdPreload();
 
     EnsureLogInit();
     DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");

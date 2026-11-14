@@ -173,7 +173,8 @@ if(WIN32)
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)
-    # Steam on Linux is 32-bit; use LINUX_32BIT=ON when cross-compiling on 64-bit host
+    # Current Steam clients are x86-64. LINUX_32BIT remains available for
+    # legacy clients; the compiler's target controls the default architecture.
     # Match Steam's pre-C++11 ABI
     target_compile_definitions(cloud_redirect PRIVATE _GLIBCXX_USE_CXX11_ABI=0 _FILE_OFFSET_BITS=64)
     target_compile_options(cloud_redirect PRIVATE -fvisibility=hidden)
@@ -222,13 +223,32 @@ else()
         else()
             target_link_libraries(cloud_redirect PRIVATE atomic)
         endif()
+    else()
+        # The old build only linked HTTP dependencies in its -m32 branch,
+        # leaving an apparently successful x64 DSO with unresolved curl calls.
+        # Use an isolated static dependency prefix for Steam Runtime builds.
+        set(CR_DEPS_PREFIX "" CACHE PATH "Static curl/OpenSSL dependency prefix")
+        if(CR_DEPS_PREFIX)
+            target_include_directories(cloud_redirect PRIVATE "${CR_DEPS_PREFIX}/include")
+            target_link_libraries(cloud_redirect PRIVATE
+                "${CR_DEPS_PREFIX}/lib/libcurl.a"
+                "${CR_DEPS_PREFIX}/lib/libssl.a"
+                "${CR_DEPS_PREFIX}/lib/libcrypto.a")
+            target_link_options(cloud_redirect PRIVATE -Wl,--exclude-libs,ALL)
+        else()
+            find_package(CURL REQUIRED)
+            target_link_libraries(cloud_redirect PRIVATE CURL::libcurl)
+        endif()
     endif()
+    # A loadable injected library must not defer missing dependency errors to
+    # Steam's dynamic loader.
+    target_link_options(cloud_redirect PRIVATE -Wl,-z,defs)
     # Strip in release
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_link_options(cloud_redirect PRIVATE -s)
     endif()
 
-    # CLI wrapper (32-bit loader for cloud_redirect.so)
+    # CLI wrapper must have the same architecture as cloud_redirect.so.
     add_executable(cloud_redirect_cli
         src/platform/linux/cli_main.cpp
     )
@@ -485,6 +505,33 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
     endif()
     add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT LINUX_32BIT)
+
+if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux_kv64_resolver_tests.cpp)
+    add_executable(linux_kv64_resolver_tests tests/linux_kv64_resolver_tests.cpp)
+    target_include_directories(linux_kv64_resolver_tests PRIVATE src/platform/linux)
+    add_test(NAME linux_kv64_resolver_tests COMMAND linux_kv64_resolver_tests)
+endif()
+
+if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux64_protobuf_abi_tests.cpp)
+    add_executable(linux64_protobuf_abi_tests tests/linux64_protobuf_abi_tests.cpp)
+    target_include_directories(linux64_protobuf_abi_tests PRIVATE src/common src/providers src/platform/linux)
+    target_compile_definitions(linux64_protobuf_abi_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_options(linux64_protobuf_abi_tests PRIVATE -ffunction-sections -fdata-sections -UNDEBUG)
+    target_link_options(linux64_protobuf_abi_tests PRIVATE -Wl,--gc-sections)
+    add_test(NAME linux64_protobuf_abi_tests COMMAND linux64_protobuf_abi_tests)
+endif()
+
+if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux_vtable_probe.cpp)
+    add_executable(linux_vtable_probe tests/linux_vtable_probe.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_vtable_probe PRIVATE src/common src/providers src/platform/linux)
+    target_compile_definitions(linux_vtable_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=0 CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+    target_link_libraries(linux_vtable_probe PRIVATE dl pthread)
+endif()
+
+endif() # Linux x86-64 tests
 
 # ── UI (Windows only) ───────────────────────────────────────────────────
 

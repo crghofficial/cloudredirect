@@ -11,6 +11,18 @@
 
 namespace GamesPlayedHook {
 
+#if defined(__x86_64__)
+// The legacy observer below emits i386 pushad/PIC trampolines and reads the
+// 32-bit CProtoBufMsg layout. Never apply those bytes to a 64-bit client. Cloud
+// save RPC hooks do not depend on this optional playtime/achievement observer.
+void SetSerializer(SerializeBodyFn) {}
+bool Install(uintptr_t, size_t) {
+    LOG("[GamesPlayed] x86-64 send observer is not implemented; inline patch skipped");
+    return false;
+}
+void Remove() {}
+#else
+
 // CProtoBufMsg 32-bit layout (reversed from ctor): EMsg at +20 (high bit is the
 // send flag, mask it off), body protobuf object pointer at +32.
 static constexpr size_t OFF_EMSG = 20;
@@ -281,5 +293,7 @@ void Remove() {
 
     g_installed.store(false, std::memory_order_release);
 }
+
+#endif
 
 } // namespace GamesPlayedHook

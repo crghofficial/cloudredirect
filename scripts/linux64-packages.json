@@ -1,0 +1,70 @@
+[
+  {
+    "Package": "gcc-10-base",
+    "Version": "10.2.1-6",
+    "Filename": "pool/main/g/gcc-10/gcc-10-base_10.2.1-6_amd64.deb",
+    "SHA256": "be65535e94f95fbf04b104e8ab36790476f063374430f7dfc6c516cbe2d2cd1e"
+  },
+  {
+    "Package": "libgcc-10-dev",
+    "Version": "10.2.1-6",
+    "Filename": "pool/main/g/gcc-10/libgcc-10-dev_10.2.1-6_amd64.deb",
+    "SHA256": "3b711374092b84e732c4e73cf33e02cff02e34a5f105eb6467de8d9038e4cd9d"
+  },
+  {
+    "Package": "libgcc-s1",
+    "Version": "10.2.1-6",
+    "Filename": "pool/main/g/gcc-10/libgcc-s1_10.2.1-6_amd64.deb",
+    "SHA256": "e478f2709d8474165bb664de42e16950c391f30eaa55bc9b3573281d83a29daf"
+  },
+  {
+    "Package": "libstdc++-10-dev",
+    "Version": "10.2.1-6",
+    "Filename": "pool/main/g/gcc-10/libstdc++-10-dev_10.2.1-6_amd64.deb",
+    "SHA256": "20b1f56863dcc5f187d6cb53b2aa6149bd013be4ec67e10c2c31a22fda619a01"
+  },
+  {
+    "Package": "libstdc++6",
+    "Version": "10.2.1-6",
+    "Filename": "pool/main/g/gcc-10/libstdc++6_10.2.1-6_amd64.deb",
+    "SHA256": "5c155c58935870bf3b4bfe769116841c0d286a74f59eccfd5645693ac23f06b1"
+  },
+  {
+    "Package": "libc-dev-bin",
+    "Version": "2.31-13+deb11u11",
+    "Filename": "pool/main/g/glibc/libc-dev-bin_2.31-13+deb11u11_amd64.deb",
+    "SHA256": "289800bcbc9e3f2718c2e13e4f2c90f15843ffcf46b26d95a15b276fe2f9ac87"
+  },
+  {
+    "Package": "libc6",
+    "Version": "2.31-13+deb11u11",
+    "Filename": "pool/main/g/glibc/libc6_2.31-13+deb11u11_amd64.deb",
+    "SHA256": "05f7264da867b37f4c5ce49266b558ea1e81e05a9464f623152fca70f3550282"
+  },
+  {
+    "Package": "libc6-dev",
+    "Version": "2.31-13+deb11u11",
+    "Filename": "pool/main/g/glibc/libc6-dev_2.31-13+deb11u11_amd64.deb",
+    "SHA256": "e7f7b45d9c5cfcf37609f0b6efd3c645272c812144703af89dfd32218fcb0fd3"
+  },
+  {
+    "Package": "linux-libc-dev",
+    "Version": "5.10.223-1",
+    "Filename": "pool/main/l/linux/linux-libc-dev_5.10.223-1_amd64.deb",
+    "SHA256": "e3be603bd12377bb90fcfb0f2048ca3a81c886e49d6f09945b82159d1c54f7b2"
+  },
+  {
+    "Package": "libgcc-12-dev",
+    "Version": "12.5.0-8ubuntu2~20~ppa3",
+    "Filename": "pool/main/g/gcc-12/libgcc-12-dev_12.5.0-8ubuntu2~20~ppa3_amd64.deb",
+    "SHA256": "26683de65428e1479fe39b2e8027130748dab2c287f01925f2cfc1a69a7cf9c1",
+    "BaseURL": "https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/"
+  },
+  {
+    "Package": "libstdc++-12-dev",
+    "Version": "12.5.0-8ubuntu2~20~ppa3",
+    "Filename": "pool/main/g/gcc-12/libstdc++-12-dev_12.5.0-8ubuntu2~20~ppa3_amd64.deb",
+    "SHA256": "109cd7d1b6cecfa94bba69268ff4f9f66f0c957ce912682c95fac1580d29ce98",
+    "BaseURL": "https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/"
+  }
+]

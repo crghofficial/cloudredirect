@@ -5,7 +5,10 @@
 #include <cstring>
 #include <cinttypes>
 #include <mutex>
+#include <vector>
+#include <elf.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -14,9 +17,10 @@ static constexpr const char RTTI_NAME[] = "30CClientUnifiedServiceTransport";
 
 // Steam's loader hides libraries from dl_iterate_phdr; parse /proc/self/maps.
 
-static struct { uintptr_t start; uintptr_t end; } g_readableRanges[64];
+struct MapRange { uintptr_t start; uintptr_t end; };
+static std::vector<MapRange> g_readableRanges;
 static int g_readableCount = 0;
-static struct { uintptr_t start; uintptr_t end; } g_writableRanges[64];
+static std::vector<MapRange> g_writableRanges;
 static int g_writableCount = 0;
 
 // Probe readability via write() to /dev/null. Used before g_readableRanges is populated.
@@ -58,6 +62,8 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
     uintptr_t labeledMax = 0;
     g_readableCount = 0;
     g_writableCount = 0;
+    g_readableRanges.clear();
+    g_writableRanges.clear();
     char line[512];
 
     while (fgets(line, sizeof(line), f))
@@ -95,6 +101,23 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
                   (void*)labeledMin, (void*)base, labeledMin - base);
     }
 
+#if defined(__x86_64__)
+    // The final PT_LOAD contains anonymous .bss past the last file-labelled
+    // mapping. Protobuf default instances and the engine global live there.
+    if (CanReadMemory(reinterpret_cast<void*>(base), sizeof(Elf64_Ehdr))) {
+        const auto* eh = reinterpret_cast<const Elf64_Ehdr*>(base);
+        if (eh->e_ident[EI_CLASS] == ELFCLASS64 && eh->e_phentsize == sizeof(Elf64_Phdr) &&
+            eh->e_phnum < 128 && eh->e_phoff < 0x10000 &&
+            CanReadMemory(reinterpret_cast<void*>(base + eh->e_phoff), eh->e_phnum * sizeof(Elf64_Phdr))) {
+            const auto* ph = reinterpret_cast<const Elf64_Phdr*>(base + eh->e_phoff);
+            for (size_t i = 0; i < eh->e_phnum; ++i)
+                if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < 0x40000000 && ph[i].p_memsz < 0x40000000 &&
+                    base + ph[i].p_vaddr + ph[i].p_memsz > labeledMax)
+                    labeledMax = base + ph[i].p_vaddr + ph[i].p_memsz;
+        }
+    }
+#endif
+
     // Capture readable mappings within +/-16 MiB of labeled span.
     // .data.rel.ro may be in anonymous mappings outside the labeled range.
     // Slot-pointer validation still uses the tight labeled span.
@@ -112,16 +135,14 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
         if (end_addr <= scanLo || start_addr >= scanHi) continue;
 
-        if (perms[0] == 'r' && g_readableCount < 64)
+        if (perms[0] == 'r')
         {
-            g_readableRanges[g_readableCount].start = start_addr;
-            g_readableRanges[g_readableCount].end = end_addr;
+            g_readableRanges.push_back({start_addr, end_addr});
             g_readableCount++;
         }
-        if (perms[0] == 'r' && perms[1] == 'w' && g_writableCount < 64)
+        if (perms[0] == 'r' && perms[1] == 'w')
         {
-            g_writableRanges[g_writableCount].start = start_addr;
-            g_writableRanges[g_writableCount].end = end_addr;
+            g_writableRanges.push_back({start_addr, end_addr});
             g_writableCount++;
         }
     }
@@ -135,17 +156,21 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
     return base;
 }
 
-// Safe memory probe using write() to /dev/null -- avoids SIGSEGV
+// /dev/null does not dereference the write buffer, so write() is not a memory
+// probe. Ask the kernel to copy from our address space and reject partial reads.
 static bool CanReadMemory(const void* addr, size_t len)
 {
-    static std::once_flag devnullOnce;
-    static int devnull = -1;
-    std::call_once(devnullOnce, []() {
-        devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    });
-    if (devnull < 0)
-        return false;
-    return (write(devnull, addr, len) == (ssize_t)len);
+    char scratch[4096];
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = (len - offset > sizeof(scratch)) ? sizeof(scratch) : len - offset;
+        iovec local{scratch, chunk};
+        iovec remote{reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + offset), chunk};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != static_cast<ssize_t>(chunk))
+            return false;
+        offset += chunk;
+    }
+    return true;
 }
 
 // Scan readable ranges within steamclient for a byte sequence.
@@ -398,6 +423,22 @@ static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr
         return false;
 
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+
+#if defined(__x86_64__)
+    // Steam 1792618285, SysV ABI: appId is ESI. This method checks the per-app
+    // override tree at this+0x300 and then UFS external-file policy. Match both
+    // argument handling and that tree access, not a slot number alone.
+    static constexpr uint8_t prefix[] = {
+        0x85,0xf6,0x41,0x54,0x55,0x48,0x89,0xfd,0x53,0x89,0xf3,0x0f,0x84
+    };
+    static constexpr uint8_t tree[] = {0x48,0x63,0x85,0x00,0x03,0x00,0x00,0x83,0xf8,0xff};
+    // SLSsteam may already own a five-byte entry detour. Its untouched
+    // instruction suffix still identifies this method; our saved original
+    // pointer preserves that existing detour for non-namespace apps.
+    const bool entryMatches = memcmp(p, prefix, sizeof(prefix)) == 0 ||
+        (p[0] == 0xe9 && memcmp(p + 5, prefix + 5, sizeof(prefix) - 5) == 0);
+    return entryMatches && memcmp(p + 17, tree, sizeof(tree)) == 0;
+#endif
 
     // Pattern A (older builds): args passed via esp offsets
     //   +0:  55 57 56 53 E8 ?? ?? ?? ??  (push ebp/edi/esi/ebx + call PIC thunk)

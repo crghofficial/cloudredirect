@@ -48,6 +48,8 @@ std::string CmdPublishFullManifest(const std::string& provider, const std::strin
 extern "C" {
 #ifdef _WIN32
     __declspec(dllexport)
+#else
+    __attribute__((visibility("default")))
 #endif
     int CloudRedirect_CliMain(int argc, char** argv);
 }

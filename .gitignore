@@ -21,3 +21,9 @@ tools/
 flatpak/release.sh
 ui/native/
 release-*/
+
+# Retain regression fixtures for the Linux x86-64 port.
+!tests/linux64_protobuf_abi_tests.cpp
+!tests/linux64_steam_protobuf_smoke.cpp
+!tests/linux_kv64_resolver_tests.cpp
+!tests/linux_vtable_probe.cpp

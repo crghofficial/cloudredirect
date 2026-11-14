@@ -84,6 +84,9 @@ Or don't build it? Building Windows apps is pain.
 
 ## Building from source (Linux)
 
+For current x86-64 Steam clients, see [Linux x86-64 build and validation](LINUX64.md). The `LINUX_32BIT` instructions below target legacy i386 clients.
+
+
 Oooooh boy. Yeah. Have fun. 
 
 You need to build against glibc 2.31 or older. Ubuntu 20.04 would work, if you dislike yourself. There's also an ancient version of Fedora that fits the bill. Or Debian 11. Distrobox is the way, here. Don't even bother trying to build under whatever distro you daily, you'll wind up fighting it for no reason. Distrobox exists for a reason. 

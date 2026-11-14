@@ -14,6 +14,10 @@
 #include <link.h>
 #include <cstdio>
 #include <cstring>
+#if defined(__x86_64__)
+#include "kv_resolver64.h"
+#include "vtable_hook.h"
+#endif
 #endif
 
 namespace SteamKvInjector {
@@ -356,6 +360,350 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
                 if (rule.platforms & 8) {
                     void* k = g_r.kvFindKey(platformsKv, "3", 1, nullptr);
                     if (k) g_r.kvSetString(k, "linux");
+                }
+            }
+        }
+
+        ++injected;
+    }
+
+    LOG("[KvInjector] InjectSaveFiles app=%u: injected %d savefiles rules", appId, injected);
+    return injected > 0;
+}
+
+#elif defined(__x86_64__)
+
+using ReadConfigU64Fn = uint64_t (*)(void *, uint32_t, uint32_t, const char *, uint64_t);
+using GetSectionFn = void *(*)(void *, uint32_t);
+using KvFindKeyFn = void *(*)(void *, const char *, uint8_t, void *);
+using KvSetUint64Fn = void (*)(void *, uint64_t);
+using KvSetInt32Fn = void (*)(void *, int32_t);
+using KvSetStringFn = void (*)(void *, const char *);
+struct Resolved {
+    void **globalEnginePtr = nullptr;
+    ReadConfigU64Fn readConfigU64 = nullptr;
+    GetSectionFn getSection = nullptr;
+    KvFindKeyFn kvFindKey = nullptr;
+    KvSetUint64Fn kvSetUint64 = nullptr;
+    KvSetInt32Fn kvSetInt32 = nullptr;
+    KvSetStringFn kvSetString = nullptr;
+    uint32_t cacheOffset = 0;
+};
+static Resolved g_r;
+static std::atomic<bool> g_ready{false};
+static std::once_flag g_initOnce;
+static constexpr uint32_t kSectionUfs = 10;
+
+void Configure(const ResolvedKvAddrs &) {}
+bool Init() {
+    std::call_once(g_initOnce, [] {
+        size_t size = 0;
+        uintptr_t base = VtableHook::FindSteamclient(size);
+        if (!base)
+            return;
+        std::vector<LinuxKv64::Range> ranges;
+        FILE *f = fopen("/proc/self/maps", "r");
+        if (!f)
+            return;
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long lo = 0, hi = 0;
+            char perms[5] = {};
+            if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) != 3 || perms[0] != 'r')
+                continue;
+            LinuxKv64::Range range;
+            if (LinuxKv64::ClipRange(lo, hi, base, base + size, perms[2] == 'x', perms[1] == 'w',
+                                     range))
+                ranges.push_back(range);
+        }
+        fclose(f);
+        LinuxKv64::Addresses a;
+        if (!LinuxKv64::Resolve(ranges, a)) {
+            LOG("[KvInjector] Linux x86_64 resolver failed validation; no KV writes enabled");
+            return;
+        }
+        g_r.globalEnginePtr = reinterpret_cast<void **>(a.engineGlobal);
+        g_r.cacheOffset = a.cacheOffset;
+        g_r.readConfigU64 = reinterpret_cast<ReadConfigU64Fn>(a.readConfig);
+        g_r.getSection = reinterpret_cast<GetSectionFn>(a.getSection);
+        g_r.kvFindKey = reinterpret_cast<KvFindKeyFn>(a.findKey);
+        g_r.kvSetUint64 = reinterpret_cast<KvSetUint64Fn>(a.setU64);
+        g_r.kvSetInt32 = reinterpret_cast<KvSetInt32Fn>(a.setInt);
+        g_r.kvSetString = reinterpret_cast<KvSetStringFn>(a.setString);
+        g_ready.store(true, std::memory_order_release);
+        LOG("[KvInjector] Linux x86_64 resolved: engine=%p cache=0x%x read=%p section=%p find=%p "
+            "setters=%p/%p/%p",
+            g_r.globalEnginePtr, g_r.cacheOffset, (void *)a.readConfig, (void *)a.getSection,
+            (void *)a.findKey, (void *)a.setU64, (void *)a.setInt, (void *)a.setString);
+    });
+    return g_ready.load(std::memory_order_acquire);
+}
+bool IsReady() {
+    return g_ready.load(std::memory_order_acquire);
+}
+static void *GetCachePtr() {
+    if (!g_r.globalEnginePtr || !*g_r.globalEnginePtr)
+        return nullptr;
+    return static_cast<uint8_t *>(*g_r.globalEnginePtr) + g_r.cacheOffset;
+}
+
+bool ReadAppQuota(uint32_t appId, uint64_t &outQuotaBytes, uint32_t &outMaxNumFiles) {
+    if (!g_ready.load(std::memory_order_acquire))
+        return false;
+    void *cache = GetCachePtr();
+    if (!cache)
+        return false;
+
+    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+    uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+
+    if (!QuotaValueLooksValid(quota, files)) {
+        if (quota != 0 || files != 0) {
+            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu", appId,
+                (unsigned long long)quota, (unsigned long long)files);
+        }
+        outQuotaBytes = 0;
+        outMaxNumFiles = 0;
+        return true;
+    }
+
+    outQuotaBytes = quota;
+    outMaxNumFiles = static_cast<uint32_t>(files);
+    return true;
+}
+
+// Layout validated by the ReadConfigU64 signature: nodes have 32-byte stride.
+static void *ResolveAppInfo(void *cache, uint32_t appId) {
+    if (!cache)
+        return nullptr;
+    auto *b = static_cast<uint8_t *>(cache);
+    int32_t idx = *reinterpret_cast<int32_t *>(b + 0x28);
+    uint8_t *nodes = *reinterpret_cast<uint8_t **>(b + 0x40);
+    if (!nodes)
+        return nullptr;
+    // The Steam tree uses 32-bit indices. Bound corrupted/cyclic walks.
+    for (size_t count = 0; idx >= 0 && count < 1000000; ++count) {
+        auto *node = nodes + static_cast<size_t>(idx) * 32;
+        uint32_t key = *reinterpret_cast<uint32_t *>(node + 16);
+        if (key == appId)
+            return *reinterpret_cast<void **>(node + 24);
+        idx = *reinterpret_cast<int32_t *>(node + (appId < key ? 0 : 4));
+    }
+    return nullptr;
+}
+
+bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
+    if (!g_ready.load(std::memory_order_acquire))
+        return false;
+    if (quotaBytes == 0 || maxNumFiles == 0) {
+        LOG("[KvInjector] InjectAppQuota app=%u: refusing zero values "
+            "(quota=%llu files=%u)",
+            appId, (unsigned long long)quotaBytes, maxNumFiles);
+        return false;
+    }
+
+    void *cache = GetCachePtr();
+    if (!cache) {
+        LOG("[KvInjector] InjectAppQuota app=%u: cache pointer null", appId);
+        return false;
+    }
+
+    void *appInfo = ResolveAppInfo(cache, appId);
+    if (!appInfo) {
+        LOG("[KvInjector] InjectAppQuota app=%u: no app info entry "
+            "(PICS has never returned for this app)",
+            appId);
+        return false;
+    }
+
+    void *ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) {
+        LOG("[KvInjector] InjectAppQuota app=%u: ufs section missing "
+            "(app config has no cloud config at all)",
+            appId);
+        return false;
+    }
+
+    // Preserve Steam's PICS values only if plausible; overwrite garbage.
+    uint64_t existingQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+    uint64_t existingFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+    bool existingValid = QuotaValueLooksValid(existingQuota, existingFiles);
+
+    bool wroteQuota = false;
+    bool wroteFiles = false;
+
+    bool quotaNeedsWrite =
+        (existingQuota == 0) || (existingQuota > kMaxPlausibleQuotaBytes) || !existingValid;
+    bool filesNeedsWrite =
+        (existingFiles == 0) || (existingFiles > kMaxPlausibleMaxFiles) || !existingValid;
+
+    if (quotaNeedsWrite) {
+        void *quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
+        if (quotaKv) {
+            uint32_t lo = static_cast<uint32_t>(quotaBytes & 0xFFFFFFFFu);
+            uint32_t hi = static_cast<uint32_t>((quotaBytes >> 32) & 0xFFFFFFFFu);
+            g_r.kvSetUint64(quotaKv, (uint64_t(hi) << 32) | lo);
+            wroteQuota = true;
+        }
+    }
+    if (filesNeedsWrite) {
+        void *filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
+        if (filesKv) {
+            g_r.kvSetInt32(filesKv, static_cast<int32_t>(maxNumFiles));
+            wroteFiles = true;
+        }
+    }
+
+    if (wroteQuota || wroteFiles) {
+        LOG("[KvInjector] InjectAppQuota app=%u: injected quota=%llu files=%u "
+            "(wroteQuota=%d wroteFiles=%d, existingQuota=%llu existingFiles=%llu)",
+            appId, (unsigned long long)quotaBytes, maxNumFiles, wroteQuota ? 1 : 0,
+            wroteFiles ? 1 : 0, (unsigned long long)existingQuota,
+            (unsigned long long)existingFiles);
+    } else {
+        LOG("[KvInjector] InjectAppQuota app=%u: skipped (Steam already has "
+            "quota=%llu files=%llu)",
+            appId, (unsigned long long)existingQuota, (unsigned long long)existingFiles);
+    }
+    return true;
+}
+
+bool EnsureMaxNumFilesFloor(uint32_t appId, uint32_t floorFiles, uint64_t floorBytes) {
+    if (!g_ready.load(std::memory_order_acquire))
+        return false;
+    if (floorFiles == 0)
+        return false;
+    if (floorFiles > kMaxPlausibleMaxFiles)
+        return false;
+
+    void *cache = GetCachePtr();
+    if (!cache)
+        return false;
+    void *appInfo = ResolveAppInfo(cache, appId);
+    if (!appInfo)
+        return false;
+    void *ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs)
+        return false;
+
+    uint64_t curFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+    uint64_t curQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+
+    bool wrote = false;
+    if (curFiles < floorFiles) {
+        void *filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
+        if (filesKv) {
+            g_r.kvSetInt32(filesKv, static_cast<int32_t>(floorFiles));
+            wrote = true;
+            LOG("[KvInjector] EnsureMaxNumFilesFloor app=%u: raised maxnumfiles %llu -> %u", appId,
+                (unsigned long long)curFiles, floorFiles);
+        }
+    }
+    // Cap (not skip): see Windows impl -- dropping the quota raise while raising
+    // maxnumfiles would reopen byte-quota eviction for multi-root apps.
+    if (floorBytes > kMaxPlausibleQuotaBytes)
+        floorBytes = kMaxPlausibleQuotaBytes;
+    if (floorBytes > 0 && curQuota < floorBytes) {
+        void *quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
+        if (quotaKv) {
+            uint32_t lo = static_cast<uint32_t>(floorBytes & 0xFFFFFFFFu);
+            uint32_t hi = static_cast<uint32_t>((floorBytes >> 32) & 0xFFFFFFFFu);
+            g_r.kvSetUint64(quotaKv, (uint64_t(hi) << 32) | lo);
+            wrote = true;
+            LOG("[KvInjector] EnsureMaxNumFilesFloor app=%u: raised quota %llu -> %llu", appId,
+                (unsigned long long)curQuota, (unsigned long long)floorBytes);
+        }
+    }
+    return wrote;
+}
+
+bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule> &rules) {
+    if (!g_ready.load(std::memory_order_acquire))
+        return false;
+    if (rules.empty())
+        return false;
+
+    void *cache = GetCachePtr();
+    if (!cache) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: cache pointer null", appId);
+        return false;
+    }
+
+    void *appInfo = ResolveAppInfo(cache, appId);
+    if (!appInfo) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: no app info entry", appId);
+        return false;
+    }
+
+    void *ufs = g_r.getSection(appInfo, kSectionUfs);
+    if (!ufs) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: ufs section missing", appId);
+        return false;
+    }
+
+    // Check if savefiles already exists with children. If so, don't clobber.
+    void *existing = g_r.kvFindKey(ufs, "savefiles", 0, nullptr);
+    if (existing) {
+        void *child0 = g_r.kvFindKey(existing, "0", 0, nullptr);
+        if (child0) {
+            LOG("[KvInjector] InjectSaveFiles app=%u: savefiles already populated, skipping",
+                appId);
+            return true;
+        }
+    }
+
+    void *savefiles = g_r.kvFindKey(ufs, "savefiles", 1, nullptr);
+    if (!savefiles) {
+        LOG("[KvInjector] InjectSaveFiles app=%u: failed to create savefiles key", appId);
+        return false;
+    }
+
+    int injected = 0;
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const auto &rule = rules[i];
+        std::string idxStr = std::to_string(i);
+
+        void *entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
+        if (!entry)
+            continue;
+
+        void *rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
+        if (rootKv)
+            g_r.kvSetString(rootKv, rule.root.c_str());
+
+        if (!rule.path.empty()) {
+            void *pathKv = g_r.kvFindKey(entry, "path", 1, nullptr);
+            if (pathKv)
+                g_r.kvSetString(pathKv, rule.path.c_str());
+        }
+
+        void *patternKv = g_r.kvFindKey(entry, "pattern", 1, nullptr);
+        if (patternKv)
+            g_r.kvSetString(patternKv, rule.pattern.c_str());
+
+        if (rule.recursive) {
+            void *recursiveKv = g_r.kvFindKey(entry, "recursive", 1, nullptr);
+            if (recursiveKv)
+                g_r.kvSetInt32(recursiveKv, 1);
+        }
+
+        if (rule.platforms != 0xFFFFFFFFu) {
+            void *platformsKv = g_r.kvFindKey(entry, "platforms", 1, nullptr);
+            if (platformsKv) {
+                if (rule.platforms & 1) {
+                    void *k = g_r.kvFindKey(platformsKv, "1", 1, nullptr);
+                    if (k)
+                        g_r.kvSetString(k, "windows");
+                }
+                if (rule.platforms & 2) {
+                    void *k = g_r.kvFindKey(platformsKv, "2", 1, nullptr);
+                    if (k)
+                        g_r.kvSetString(k, "macos");
+                }
+                if (rule.platforms & 8) {
+                    void *k = g_r.kvFindKey(platformsKv, "3", 1, nullptr);
+                    if (k)
+                        g_r.kvSetString(k, "linux");
                 }
             }
         }

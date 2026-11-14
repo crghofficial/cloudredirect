@@ -23,7 +23,7 @@ jobs:
       matrix:
         bits: [64, 32]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install dependencies
         run: |
           if [ '${{ matrix.bits }}' = 32 ]; then
@@ -48,8 +48,20 @@ jobs:
         run: |
           cmake --build build-ci --parallel 2
           ctest --test-dir build-ci --output-on-failure
-          cr_config=$(mktemp -d)
-          XDG_CONFIG_HOME="$cr_config" build-ci/cloud_redirect_cli auth-status gdrive
+          python3 - <<'PYCLI'
+          import json
+          import os
+          import subprocess
+          import tempfile
+
+          with tempfile.TemporaryDirectory() as config:
+              result = subprocess.run(
+                  ['build-ci/cloud_redirect_cli', 'auth-status', 'gdrive'],
+                  env={**os.environ, 'XDG_CONFIG_HOME': config},
+                  text=True, capture_output=True)
+              if result.returncode != 1 or json.loads(result.stdout).get('authenticated') is not False:
+                  raise SystemExit(f'Unexpected CLI result: {result.returncode} {result.stderr}')
+          PYCLI
       - name: Build Qt UI
         if: matrix.bits == 64
         run: |
@@ -61,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -70,7 +82,7 @@ jobs:
         run: |
           scripts/build-linux64.sh
           scripts/stage-flatpak.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: cloudredirect-linux-x86_64
           path: |

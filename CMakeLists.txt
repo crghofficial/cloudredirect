@@ -223,7 +223,8 @@ else()
         else()
             target_link_libraries(cloud_redirect PRIVATE atomic)
         endif()
-    else()
+    endif()
+    if(NOT LINUX_32BIT)
         # The old build only linked HTTP dependencies in its -m32 branch,
         # leaving an apparently successful x64 DSO with unresolved curl calls.
         # Use an isolated static dependency prefix for Steam Runtime builds.
@@ -506,32 +507,50 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
     add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT LINUX_32BIT)
+    find_package(Qt6 QUIET COMPONENTS Core)
+    if(TARGET Qt6::Core)
+        add_executable(native_binary_tests tests/native_binary_tests.cpp)
+        target_include_directories(native_binary_tests PRIVATE ui-linux/src)
+        target_link_libraries(native_binary_tests PRIVATE Qt6::Core)
+        add_test(NAME native_binary_tests COMMAND native_binary_tests)
+        add_executable(deployer_file_tests tests/deployer_file_tests.cpp)
+        target_link_libraries(deployer_file_tests PRIVATE Qt6::Core)
+        target_compile_options(deployer_file_tests PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(deployer_file_tests PRIVATE -Wl,--gc-sections)
+        add_test(NAME deployer_file_tests COMMAND deployer_file_tests)
+    endif()
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT LINUX_32BIT)
-
-if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux_kv64_resolver_tests.cpp)
     add_executable(linux_kv64_resolver_tests tests/linux_kv64_resolver_tests.cpp)
     target_include_directories(linux_kv64_resolver_tests PRIVATE src/platform/linux)
     add_test(NAME linux_kv64_resolver_tests COMMAND linux_kv64_resolver_tests)
-endif()
 
-if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux64_protobuf_abi_tests.cpp)
-    add_executable(linux64_protobuf_abi_tests tests/linux64_protobuf_abi_tests.cpp)
-    target_include_directories(linux64_protobuf_abi_tests PRIVATE src/common src/providers src/platform/linux)
-    target_compile_definitions(linux64_protobuf_abi_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
-    target_compile_options(linux64_protobuf_abi_tests PRIVATE -ffunction-sections -fdata-sections -UNDEBUG)
-    target_link_options(linux64_protobuf_abi_tests PRIVATE -Wl,--gc-sections)
+    add_executable(linux_kv_tree_tests tests/linux_kv_tree_tests.cpp
+        src/platform/linux/vtable_hook.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_kv_tree_tests PRIVATE src/common src/platform/linux)
+    target_compile_definitions(linux_kv_tree_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_options(linux_kv_tree_tests PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(linux_kv_tree_tests PRIVATE -Wl,--gc-sections)
+    add_test(NAME linux_kv_tree_tests COMMAND linux_kv_tree_tests)
+
+    foreach(test IN ITEMS linux64_protobuf_abi_tests linux64_steam_protobuf_smoke)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/providers src/platform/linux)
+        target_compile_definitions(${test} PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+        target_compile_options(${test} PRIVATE -ffunction-sections -fdata-sections -UNDEBUG)
+        target_link_options(${test} PRIVATE -Wl,--gc-sections)
+        target_link_libraries(${test} PRIVATE dl pthread)
+    endforeach()
     add_test(NAME linux64_protobuf_abi_tests COMMAND linux64_protobuf_abi_tests)
-endif()
 
-if(NOT WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/tests/linux_vtable_probe.cpp)
     add_executable(linux_vtable_probe tests/linux_vtable_probe.cpp src/platform/linux/log.cpp)
     target_include_directories(linux_vtable_probe PRIVATE src/common src/providers src/platform/linux)
     target_compile_definitions(linux_vtable_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=0 CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
     target_link_libraries(linux_vtable_probe PRIVATE dl pthread)
 endif()
-
-endif() # Linux x86-64 tests
 
 # ── UI (Windows only) ───────────────────────────────────────────────────
 

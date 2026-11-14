@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 // Standalone regression test for the Linux transport's internal ABI boundary.
 // Compile with function/data sections and --gc-sections; unrelated RPC/provider
 // paths from cloud_hooks.cpp are deliberately not linked into this fixture.
@@ -55,6 +58,20 @@ int main() {
     assert(!ParseIntoMessage(&msg, wire, sizeof(wire)));
     g_parseFromArray64 = &FakeParseSuccess;
     assert(ParseIntoMessage(&msg, wire, sizeof(wire)));
+
+    // RPC helpers can run on multiple Steam threads concurrently.
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 4; ++worker) {
+        workers.emplace_back([&] {
+            FakeMessage local{vtable, 4, 0};
+            for (int call = 0; call < 1000; ++call) {
+                assert(SerializeMessage(&local).size() == 4);
+                assert(ParseIntoMessage(&local, wire, sizeof(wire)));
+            }
+        });
+    }
+    for (auto& worker : workers)
+        worker.join();
 
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     auto *pages = static_cast<uint8_t *>(

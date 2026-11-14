@@ -371,7 +371,8 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
     return injected > 0;
 }
 
-#elif defined(__x86_64__)
+#else // Linux
+#if defined(__x86_64__)
 
 using ReadConfigU64Fn = uint64_t (*)(void *, uint32_t, uint32_t, const char *, uint64_t);
 using GetSectionFn = void *(*)(void *, uint32_t);
@@ -441,281 +442,49 @@ bool Init() {
 bool IsReady() {
     return g_ready.load(std::memory_order_acquire);
 }
-static void *GetCachePtr() {
-    if (!g_r.globalEnginePtr || !*g_r.globalEnginePtr)
+static void* GetCachePtr() {
+    uintptr_t engine = 0;
+    if (!g_r.globalEnginePtr ||
+        !VtableHook::ReadMemory(g_r.globalEnginePtr, &engine, sizeof(engine)) ||
+        !engine || g_r.cacheOffset > UINTPTR_MAX - engine)
         return nullptr;
-    return static_cast<uint8_t *>(*g_r.globalEnginePtr) + g_r.cacheOffset;
+    return reinterpret_cast<void*>(engine + g_r.cacheOffset);
 }
 
-bool ReadAppQuota(uint32_t appId, uint64_t &outQuotaBytes, uint32_t &outMaxNumFiles) {
-    if (!g_ready.load(std::memory_order_acquire))
-        return false;
-    void *cache = GetCachePtr();
-    if (!cache)
-        return false;
-
-    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
-    uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-
-    if (!QuotaValueLooksValid(quota, files)) {
-        if (quota != 0 || files != 0) {
-            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu", appId,
-                (unsigned long long)quota, (unsigned long long)files);
-        }
-        outQuotaBytes = 0;
-        outMaxNumFiles = 0;
-        return true;
-    }
-
-    outQuotaBytes = quota;
-    outMaxNumFiles = static_cast<uint32_t>(files);
-    return true;
-}
-
-// Layout validated by the ReadConfigU64 signature: nodes have 32-byte stride.
-static void *ResolveAppInfo(void *cache, uint32_t appId) {
+// Read each node into local storage before following its child indices.
+// A stale or corrupt index must not turn a lookup into an unchecked read.
+static void* ResolveAppInfo(void* cache, uint32_t appId) {
     if (!cache)
         return nullptr;
-    auto *b = static_cast<uint8_t *>(cache);
-    int32_t idx = *reinterpret_cast<int32_t *>(b + 0x28);
-    uint8_t *nodes = *reinterpret_cast<uint8_t **>(b + 0x40);
-    if (!nodes)
+    auto* bytes = static_cast<uint8_t*>(cache);
+    int32_t index = -1;
+    uintptr_t nodes = 0;
+    if (!VtableHook::ReadMemory(bytes + 0x28, &index, sizeof(index)) ||
+        !VtableHook::ReadMemory(bytes + 0x40, &nodes, sizeof(nodes)) || !nodes)
         return nullptr;
-    // The Steam tree uses 32-bit indices. Bound corrupted/cyclic walks.
-    for (size_t count = 0; idx >= 0 && count < 1000000; ++count) {
-        auto *node = nodes + static_cast<size_t>(idx) * 32;
-        uint32_t key = *reinterpret_cast<uint32_t *>(node + 16);
-        if (key == appId)
-            return *reinterpret_cast<void **>(node + 24);
-        idx = *reinterpret_cast<int32_t *>(node + (appId < key ? 0 : 4));
+    struct Node {
+        int32_t left, right;
+        uint64_t links;
+        uint32_t appId, padding;
+        void* appInfo;
+    };
+    static_assert(sizeof(Node) == 32);
+    // A red-black tree with 32-bit indices has height below 64.
+    for (size_t visited = 0; index >= 0 && visited < 64; ++visited) {
+        const size_t offset = static_cast<size_t>(index) * sizeof(Node);
+        if (offset > UINTPTR_MAX - nodes)
+            return nullptr;
+        Node node{};
+        if (!VtableHook::ReadMemory(reinterpret_cast<void*>(nodes + offset), &node, sizeof(node)))
+            return nullptr;
+        if (node.appId == appId)
+            return node.appInfo;
+        index = appId < node.appId ? node.left : node.right;
     }
     return nullptr;
 }
 
-bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
-    if (!g_ready.load(std::memory_order_acquire))
-        return false;
-    if (quotaBytes == 0 || maxNumFiles == 0) {
-        LOG("[KvInjector] InjectAppQuota app=%u: refusing zero values "
-            "(quota=%llu files=%u)",
-            appId, (unsigned long long)quotaBytes, maxNumFiles);
-        return false;
-    }
-
-    void *cache = GetCachePtr();
-    if (!cache) {
-        LOG("[KvInjector] InjectAppQuota app=%u: cache pointer null", appId);
-        return false;
-    }
-
-    void *appInfo = ResolveAppInfo(cache, appId);
-    if (!appInfo) {
-        LOG("[KvInjector] InjectAppQuota app=%u: no app info entry "
-            "(PICS has never returned for this app)",
-            appId);
-        return false;
-    }
-
-    void *ufs = g_r.getSection(appInfo, kSectionUfs);
-    if (!ufs) {
-        LOG("[KvInjector] InjectAppQuota app=%u: ufs section missing "
-            "(app config has no cloud config at all)",
-            appId);
-        return false;
-    }
-
-    // Preserve Steam's PICS values only if plausible; overwrite garbage.
-    uint64_t existingQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
-    uint64_t existingFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-    bool existingValid = QuotaValueLooksValid(existingQuota, existingFiles);
-
-    bool wroteQuota = false;
-    bool wroteFiles = false;
-
-    bool quotaNeedsWrite =
-        (existingQuota == 0) || (existingQuota > kMaxPlausibleQuotaBytes) || !existingValid;
-    bool filesNeedsWrite =
-        (existingFiles == 0) || (existingFiles > kMaxPlausibleMaxFiles) || !existingValid;
-
-    if (quotaNeedsWrite) {
-        void *quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
-        if (quotaKv) {
-            uint32_t lo = static_cast<uint32_t>(quotaBytes & 0xFFFFFFFFu);
-            uint32_t hi = static_cast<uint32_t>((quotaBytes >> 32) & 0xFFFFFFFFu);
-            g_r.kvSetUint64(quotaKv, (uint64_t(hi) << 32) | lo);
-            wroteQuota = true;
-        }
-    }
-    if (filesNeedsWrite) {
-        void *filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
-        if (filesKv) {
-            g_r.kvSetInt32(filesKv, static_cast<int32_t>(maxNumFiles));
-            wroteFiles = true;
-        }
-    }
-
-    if (wroteQuota || wroteFiles) {
-        LOG("[KvInjector] InjectAppQuota app=%u: injected quota=%llu files=%u "
-            "(wroteQuota=%d wroteFiles=%d, existingQuota=%llu existingFiles=%llu)",
-            appId, (unsigned long long)quotaBytes, maxNumFiles, wroteQuota ? 1 : 0,
-            wroteFiles ? 1 : 0, (unsigned long long)existingQuota,
-            (unsigned long long)existingFiles);
-    } else {
-        LOG("[KvInjector] InjectAppQuota app=%u: skipped (Steam already has "
-            "quota=%llu files=%llu)",
-            appId, (unsigned long long)existingQuota, (unsigned long long)existingFiles);
-    }
-    return true;
-}
-
-bool EnsureMaxNumFilesFloor(uint32_t appId, uint32_t floorFiles, uint64_t floorBytes) {
-    if (!g_ready.load(std::memory_order_acquire))
-        return false;
-    if (floorFiles == 0)
-        return false;
-    if (floorFiles > kMaxPlausibleMaxFiles)
-        return false;
-
-    void *cache = GetCachePtr();
-    if (!cache)
-        return false;
-    void *appInfo = ResolveAppInfo(cache, appId);
-    if (!appInfo)
-        return false;
-    void *ufs = g_r.getSection(appInfo, kSectionUfs);
-    if (!ufs)
-        return false;
-
-    uint64_t curFiles = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-    uint64_t curQuota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
-
-    bool wrote = false;
-    if (curFiles < floorFiles) {
-        void *filesKv = g_r.kvFindKey(ufs, "maxnumfiles", 1, nullptr);
-        if (filesKv) {
-            g_r.kvSetInt32(filesKv, static_cast<int32_t>(floorFiles));
-            wrote = true;
-            LOG("[KvInjector] EnsureMaxNumFilesFloor app=%u: raised maxnumfiles %llu -> %u", appId,
-                (unsigned long long)curFiles, floorFiles);
-        }
-    }
-    // Cap (not skip): see Windows impl -- dropping the quota raise while raising
-    // maxnumfiles would reopen byte-quota eviction for multi-root apps.
-    if (floorBytes > kMaxPlausibleQuotaBytes)
-        floorBytes = kMaxPlausibleQuotaBytes;
-    if (floorBytes > 0 && curQuota < floorBytes) {
-        void *quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
-        if (quotaKv) {
-            uint32_t lo = static_cast<uint32_t>(floorBytes & 0xFFFFFFFFu);
-            uint32_t hi = static_cast<uint32_t>((floorBytes >> 32) & 0xFFFFFFFFu);
-            g_r.kvSetUint64(quotaKv, (uint64_t(hi) << 32) | lo);
-            wrote = true;
-            LOG("[KvInjector] EnsureMaxNumFilesFloor app=%u: raised quota %llu -> %llu", appId,
-                (unsigned long long)curQuota, (unsigned long long)floorBytes);
-        }
-    }
-    return wrote;
-}
-
-bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule> &rules) {
-    if (!g_ready.load(std::memory_order_acquire))
-        return false;
-    if (rules.empty())
-        return false;
-
-    void *cache = GetCachePtr();
-    if (!cache) {
-        LOG("[KvInjector] InjectSaveFiles app=%u: cache pointer null", appId);
-        return false;
-    }
-
-    void *appInfo = ResolveAppInfo(cache, appId);
-    if (!appInfo) {
-        LOG("[KvInjector] InjectSaveFiles app=%u: no app info entry", appId);
-        return false;
-    }
-
-    void *ufs = g_r.getSection(appInfo, kSectionUfs);
-    if (!ufs) {
-        LOG("[KvInjector] InjectSaveFiles app=%u: ufs section missing", appId);
-        return false;
-    }
-
-    // Check if savefiles already exists with children. If so, don't clobber.
-    void *existing = g_r.kvFindKey(ufs, "savefiles", 0, nullptr);
-    if (existing) {
-        void *child0 = g_r.kvFindKey(existing, "0", 0, nullptr);
-        if (child0) {
-            LOG("[KvInjector] InjectSaveFiles app=%u: savefiles already populated, skipping",
-                appId);
-            return true;
-        }
-    }
-
-    void *savefiles = g_r.kvFindKey(ufs, "savefiles", 1, nullptr);
-    if (!savefiles) {
-        LOG("[KvInjector] InjectSaveFiles app=%u: failed to create savefiles key", appId);
-        return false;
-    }
-
-    int injected = 0;
-    for (size_t i = 0; i < rules.size(); ++i) {
-        const auto &rule = rules[i];
-        std::string idxStr = std::to_string(i);
-
-        void *entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
-        if (!entry)
-            continue;
-
-        void *rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
-        if (rootKv)
-            g_r.kvSetString(rootKv, rule.root.c_str());
-
-        if (!rule.path.empty()) {
-            void *pathKv = g_r.kvFindKey(entry, "path", 1, nullptr);
-            if (pathKv)
-                g_r.kvSetString(pathKv, rule.path.c_str());
-        }
-
-        void *patternKv = g_r.kvFindKey(entry, "pattern", 1, nullptr);
-        if (patternKv)
-            g_r.kvSetString(patternKv, rule.pattern.c_str());
-
-        if (rule.recursive) {
-            void *recursiveKv = g_r.kvFindKey(entry, "recursive", 1, nullptr);
-            if (recursiveKv)
-                g_r.kvSetInt32(recursiveKv, 1);
-        }
-
-        if (rule.platforms != 0xFFFFFFFFu) {
-            void *platformsKv = g_r.kvFindKey(entry, "platforms", 1, nullptr);
-            if (platformsKv) {
-                if (rule.platforms & 1) {
-                    void *k = g_r.kvFindKey(platformsKv, "1", 1, nullptr);
-                    if (k)
-                        g_r.kvSetString(k, "windows");
-                }
-                if (rule.platforms & 2) {
-                    void *k = g_r.kvFindKey(platformsKv, "2", 1, nullptr);
-                    if (k)
-                        g_r.kvSetString(k, "macos");
-                }
-                if (rule.platforms & 8) {
-                    void *k = g_r.kvFindKey(platformsKv, "3", 1, nullptr);
-                    if (k)
-                        g_r.kvSetString(k, "linux");
-                }
-            }
-        }
-
-        ++injected;
-    }
-
-    LOG("[KvInjector] InjectSaveFiles app=%u: injected %d savefiles rules", appId, injected);
-    return injected > 0;
-}
-
-#else // !_WIN32 -- Linux 32-bit steamclient.so
+#else // Linux i386
 
 // Linux steamclient.so -- runtime signature scanning only (no hardcoded fallback RVAs)
 
@@ -1117,29 +886,6 @@ bool IsReady() {
     return g_ready.load(std::memory_order_acquire);
 }
 
-bool ReadAppQuota(uint32_t appId, uint64_t& outQuotaBytes, uint32_t& outMaxNumFiles) {
-    if (!g_ready.load(std::memory_order_acquire)) return false;
-    void* cache = GetCachePtr();
-    if (!cache) return false;
-
-    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
-    uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
-
-    if (!QuotaValueLooksValid(quota, files)) {
-        if (quota != 0 || files != 0) {
-            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu",
-                appId, (unsigned long long)quota, (unsigned long long)files);
-        }
-        outQuotaBytes = 0;
-        outMaxNumFiles = 0;
-        return true;
-    }
-
-    outQuotaBytes  = quota;
-    outMaxNumFiles = static_cast<uint32_t>(files);
-    return true;
-}
-
 // Inline BST walk: manager+76=rootIndex, manager+96=nodes (24-byte stride).
 // node+16=appId, node+20=appInfo. Returns null if appId not in cache.
 static void* ResolveAppInfo(void* cache, uint32_t appId) {
@@ -1162,6 +908,41 @@ static void* ResolveAppInfo(void* cache, uint32_t appId) {
         }
     }
     return nullptr;
+}
+
+
+#endif // Linux architecture
+
+// Keep quota and save-rule behavior shared by both Linux architectures.
+static void SetQuotaValue(void* key, uint64_t value) {
+#if defined(__x86_64__)
+    g_r.kvSetUint64(key, value);
+#else
+    g_r.kvSetUint64(key, static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32));
+#endif
+}
+
+bool ReadAppQuota(uint32_t appId, uint64_t& outQuotaBytes, uint32_t& outMaxNumFiles) {
+    if (!g_ready.load(std::memory_order_acquire)) return false;
+    void* cache = GetCachePtr();
+    if (!cache) return false;
+
+    uint64_t quota = g_r.readConfigU64(cache, appId, kSectionUfs, "quota", 0);
+    uint64_t files = g_r.readConfigU64(cache, appId, kSectionUfs, "maxnumfiles", 0);
+
+    if (!QuotaValueLooksValid(quota, files)) {
+        if (quota != 0 || files != 0) {
+            LOG("[KvInjector] ReadAppQuota app=%u: implausible quota=%llu files=%llu",
+                appId, (unsigned long long)quota, (unsigned long long)files);
+        }
+        outQuotaBytes = 0;
+        outMaxNumFiles = 0;
+        return true;
+    }
+
+    outQuotaBytes  = quota;
+    outMaxNumFiles = static_cast<uint32_t>(files);
+    return true;
 }
 
 bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
@@ -1209,9 +990,7 @@ bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles) {
     if (quotaNeedsWrite) {
         void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
         if (quotaKv) {
-            uint32_t lo = static_cast<uint32_t>(quotaBytes & 0xFFFFFFFFu);
-            uint32_t hi = static_cast<uint32_t>((quotaBytes >> 32) & 0xFFFFFFFFu);
-            g_r.kvSetUint64(quotaKv, lo, hi);
+            SetQuotaValue(quotaKv, quotaBytes);
             wroteQuota = true;
         }
     }
@@ -1268,9 +1047,7 @@ bool EnsureMaxNumFilesFloor(uint32_t appId, uint32_t floorFiles, uint64_t floorB
     if (floorBytes > 0 && curQuota < floorBytes) {
         void* quotaKv = g_r.kvFindKey(ufs, "quota", 1, nullptr);
         if (quotaKv) {
-            uint32_t lo = static_cast<uint32_t>(floorBytes & 0xFFFFFFFFu);
-            uint32_t hi = static_cast<uint32_t>((floorBytes >> 32) & 0xFFFFFFFFu);
-            g_r.kvSetUint64(quotaKv, lo, hi);
+            SetQuotaValue(quotaKv, floorBytes);
             wrote = true;
             LOG("[KvInjector] EnsureMaxNumFilesFloor app=%u: raised quota %llu -> %llu",
                 appId, (unsigned long long)curQuota, (unsigned long long)floorBytes);

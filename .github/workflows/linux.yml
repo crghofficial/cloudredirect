@@ -1,0 +1,79 @@
+name: Linux
+
+on:
+  push:
+    branches: [master, 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native ${{ matrix.bits }}-bit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        bits: [64, 32]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install dependencies
+        run: |
+          if [ '${{ matrix.bits }}' = 32 ]; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y ninja-build g++-multilib libcurl4-openssl-dev:i386
+          else
+            sudo apt-get update
+            sudo apt-get install -y ninja-build libcurl4-openssl-dev qt6-base-dev qt6-declarative-dev
+          fi
+      - name: Configure
+        run: |
+          if [ '${{ matrix.bits }}' = 32 ]; then
+            cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 \
+              -DCURL_LIBRARY=/usr/lib/i386-linux-gnu/libcurl.so \
+              -DCURL_INCLUDE_DIR=/usr/include/i386-linux-gnu
+          else
+            cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+      - name: Build and test
+        run: |
+          cmake --build build-ci --parallel 2
+          ctest --test-dir build-ci --output-on-failure
+          cr_config=$(mktemp -d)
+          XDG_CONFIG_HOME="$cr_config" build-ci/cloud_redirect_cli auth-status gdrive
+      - name: Build Qt UI
+        if: matrix.bits == 64
+        run: |
+          cmake -S ui-linux -B build-ui -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ui --parallel 2
+
+  steam-runtime:
+    name: Steam Runtime ABI and Flatpak inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build make binutils perl
+      - name: Build and validate
+        run: |
+          scripts/build-linux64.sh
+          scripts/stage-flatpak.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cloudredirect-linux-x86_64
+          path: |
+            flatpak/cloud_redirect.so
+            flatpak/cloud_redirect_cli
+          if-no-files-found: error

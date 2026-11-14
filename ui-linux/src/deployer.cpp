@@ -1,5 +1,6 @@
 #include "deployer.h"
 #include "utils.h"
+#include "native_binary.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -10,9 +11,21 @@
 #include <QCryptographicHash>
 #include <unistd.h>
 
-#define ELF_MAGIC 0x464C457F
-#define ELFCLASS32 1
-#define ELFCLASS64 2
+static bool copyNativeBinary(const QString& source, const QString& destination)
+{
+    QFile input(source);
+    QSaveFile output(destination);
+    if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
+        return false;
+    while (!input.atEnd()) {
+        const QByteArray chunk = input.read(64 * 1024);
+        if (chunk.isEmpty() || output.write(chunk) != chunk.size())
+            return false;
+    }
+    const auto permissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
+        QFileDevice::ReadGroup | QFileDevice::ExeGroup | QFileDevice::ReadOther | QFileDevice::ExeOther;
+    return input.error() == QFileDevice::NoError && output.setPermissions(permissions) && output.commit();
+}
 
 static QString getSoVersion(const QString &path)
 {
@@ -24,6 +37,8 @@ static QString getSoVersion(const QString &path)
     f.close();
 
     const char* p = data.constData();
+    if (data.size() < 20)
+        return QString();
     const char* end = p + data.size() - 20;
     
     for (; p < end; ++p) {
@@ -55,22 +70,6 @@ static QString getSoVersion(const QString &path)
     }
 
     return QString();
-}
-
-static bool isElf32Bit(const QString &path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly))
-        return false;
-    
-    unsigned char header[5];
-    if (f.read(reinterpret_cast<char*>(header), 5) != 5)
-        return false;
-    
-    if (header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
-        return false;
-    
-    return header[4] == ELFCLASS32;
 }
 
 Deployer::Deployer(QObject *parent)
@@ -133,6 +132,8 @@ void Deployer::checkPrerequisites()
     m_soDeployPath = crDir + "/cloud_redirect.so";
     m_cliDeployPath = crDir + "/cloud_redirect_cli";
 
+    m_soSourcePath.clear();
+    m_cliSourcePath.clear();
     QString appDir = QCoreApplication::applicationDirPath();
     QString bundledSo = QProcessEnvironment::systemEnvironment().value("CR_BUNDLED_SO");
     QString bundledCli = QProcessEnvironment::systemEnvironment().value("CR_BUNDLED_CLI");
@@ -155,7 +156,7 @@ void Deployer::checkPrerequisites()
     else if (QFile::exists(xdgDataHome() + "/cloud_redirect/cloud_redirect_cli"))
         m_cliSourcePath = xdgDataHome() + "/cloud_redirect/cloud_redirect_cli";
 
-    m_alreadyDeployed = QFile::exists(m_soDeployPath);
+    m_alreadyDeployed = NativeBinary::compatible(m_soDeployPath, slsDir + "/SLSsteam.so");
 
     m_headcrabInstalled = false;
     QString steamSh;
@@ -204,10 +205,12 @@ void Deployer::checkPrerequisites()
         m_statusMessage = "SLSsteam is not installed. Please install SLSsteam first.";
     } else if (!m_headcrabInstalled) {
         m_statusMessage = "h3adcr-b not installed. Did you run h3adcr-b first?";
+    } else if (QFile::exists(m_soDeployPath) && !m_alreadyDeployed) {
+        m_statusMessage = "The deployed library does not match the installed SLSsteam architecture.";
     } else if (m_updateAvailable) {
         m_statusMessage = "Update available. A newer version is bundled with this app.";
     } else if (m_alreadyDeployed) {
-        m_statusMessage = "CloudRedirect is deployed and active.";
+        m_statusMessage = "CloudRedirect is deployed. Restart Steam to load it.";
     } else if (m_soSourcePath.isEmpty()) {
         m_statusMessage = "cloud_redirect.so not found. Installation may be corrupted.";
     } else {
@@ -241,49 +244,21 @@ bool Deployer::deploy()
         return false;
     }
 
-    if (!isElf32Bit(m_soSourcePath)) {
-        m_statusMessage = "Cannot deploy: cloud_redirect.so is not 32-bit, your compile is bad.";
+    if (!NativeBinary::compatible(m_soSourcePath, xdgDataHome() + "/SLSsteam/SLSsteam.so") ||
+        !NativeBinary::compatible(m_cliSourcePath, m_soSourcePath)) {
+        m_statusMessage = "Cannot deploy: the bundled library and CLI must match the installed SLSsteam architecture.";
         emit statusMessageChanged();
         emit deployCompleted(false);
         return false;
     }
 
     QString crDir = crDataDir();
-    QDir().mkpath(crDir);
-
-    if (QFile::exists(m_soDeployPath)) {
-        if (!QFile::remove(m_soDeployPath)) {
-            m_statusMessage = "Failed to remove existing " + m_soDeployPath + " (file may be in use by Steam)";
-            emit statusMessageChanged();
-            emit deployCompleted(false);
-            return false;
-        }
-    }
-
-    if (!QFile::copy(m_soSourcePath, m_soDeployPath)) {
-        m_statusMessage = "Failed to copy cloud_redirect.so to " + m_soDeployPath;
+    if (!QDir().mkpath(crDir) || !copyNativeBinary(m_cliSourcePath, m_cliDeployPath) ||
+        !copyNativeBinary(m_soSourcePath, m_soDeployPath)) {
+        m_statusMessage = "Failed to install the native files. Retry after checking directory permissions.";
         emit statusMessageChanged();
         emit deployCompleted(false);
         return false;
-    }
-
-    QFile::setPermissions(m_soDeployPath,
-        QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
-        QFileDevice::ReadGroup | QFileDevice::ExeGroup |
-        QFileDevice::ReadOther | QFileDevice::ExeOther);
-
-    if (!m_cliSourcePath.isEmpty()) {
-        if (QFile::exists(m_cliDeployPath))
-            QFile::remove(m_cliDeployPath);
-
-        if (!QFile::copy(m_cliSourcePath, m_cliDeployPath)) {
-            qWarning("Failed to copy cloud_redirect_cli to %s", qPrintable(m_cliDeployPath));
-        } else {
-            QFile::setPermissions(m_cliDeployPath,
-                QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
-                QFileDevice::ReadGroup | QFileDevice::ExeGroup |
-                QFileDevice::ReadOther | QFileDevice::ExeOther);
-        }
     }
 
     QString configDir = crConfigDir();
@@ -305,42 +280,19 @@ bool Deployer::update()
         return false;
     }
 
-    if (!isElf32Bit(m_soSourcePath)) {
-        m_statusMessage = "Cannot update: cloud_redirect.so is not 32-bit, your compile is bad.";
+    if (!NativeBinary::compatible(m_soSourcePath, xdgDataHome() + "/SLSsteam/SLSsteam.so") ||
+        !NativeBinary::compatible(m_cliSourcePath, m_soSourcePath)) {
+        m_statusMessage = "Cannot update: the bundled library and CLI must match the installed SLSsteam architecture.";
         emit statusMessageChanged();
         return false;
     }
 
     QString crDir = crDataDir();
-    QDir().mkpath(crDir);
-
-    if (QFile::exists(m_soDeployPath)) {
-        if (!QFile::remove(m_soDeployPath)) {
-            m_statusMessage = "Cannot update: existing cloud_redirect.so is in use. Close Steam first.";
-            emit statusMessageChanged();
-            return false;
-        }
-    }
-
-    if (!QFile::copy(m_soSourcePath, m_soDeployPath)) {
-        m_statusMessage = "Failed to update cloud_redirect.so";
+    if (!QDir().mkpath(crDir) || !copyNativeBinary(m_cliSourcePath, m_cliDeployPath) ||
+        !copyNativeBinary(m_soSourcePath, m_soDeployPath)) {
+        m_statusMessage = "Failed to update the native files. Retry after checking directory permissions.";
         emit statusMessageChanged();
         return false;
-    }
-    QFile::setPermissions(m_soDeployPath,
-        QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
-        QFileDevice::ReadGroup | QFileDevice::ExeGroup |
-        QFileDevice::ReadOther | QFileDevice::ExeOther);
-
-    if (!m_cliSourcePath.isEmpty()) {
-        if (QFile::exists(m_cliDeployPath))
-            QFile::remove(m_cliDeployPath);
-        if (QFile::copy(m_cliSourcePath, m_cliDeployPath)) {
-            QFile::setPermissions(m_cliDeployPath,
-                QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
-                QFileDevice::ReadGroup | QFileDevice::ExeGroup |
-                QFileDevice::ReadOther | QFileDevice::ExeOther);
-        }
     }
 
     m_updateAvailable = false;

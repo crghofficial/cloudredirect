@@ -7,29 +7,47 @@ cr_deps="$cr_root/build-deps"
 cr_jobs="${CR_BUILD_JOBS:-4}"
 mkdir -p "$cr_deps/downloads" "$cr_deps/sysroot"
 python3 - <<'PY'
-import hashlib,json,os,pathlib,subprocess,urllib.request
-root=pathlib.Path('build-deps').resolve(); sysroot=root/'sysroot'
-for pkg in json.loads(pathlib.Path('scripts/linux64-packages.json').read_text()):
-    p=root/'downloads'/pathlib.Path(pkg['Filename']).name
-    if not p.exists(): urllib.request.urlretrieve(pkg.get('BaseURL','https://deb.debian.org/debian/')+pkg['Filename'],p)
-    if hashlib.sha256(p.read_bytes()).hexdigest()!=pkg['SHA256']:
-        raise SystemExit(f'Checksum mismatch: {p}')
-    ar=subprocess.Popen(['ar','p',str(p),'data.tar.xz'],stdout=subprocess.PIPE)
-    subprocess.run(['tar','-xJf','-','-C',str(sysroot)],stdin=ar.stdout,check=True)
-    ar.stdout.close()
-    if ar.wait(): raise SystemExit('ar failed')
-# Debian's absolute loader links must stay inside this extracted sysroot.
-for p in sysroot.rglob('*'):
-    if p.is_symlink() and os.readlink(p).startswith('/'):
-        target=str(sysroot)+os.readlink(p)
-        p.unlink();p.symlink_to(os.path.relpath(target,p.parent))
-sources=[
- ('https://www.openssl.org/source/openssl-3.5.4.tar.gz','openssl.tar.gz','967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99'),
- ('https://curl.se/download/curl-8.23.0.tar.xz','curl.tar.xz','8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5')]
-for url,name,sha in sources:
-    p=root/'downloads'/name
-    if not p.exists():urllib.request.urlretrieve(url,p)
-    if hashlib.sha256(p.read_bytes()).hexdigest()!=sha:raise SystemExit(f'Checksum mismatch: {p}')
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import urllib.request
+
+root = Path('build-deps').resolve()
+sysroot = root / 'sysroot'
+for package in json.loads(Path('scripts/linux64-packages.json').read_text()):
+    archive = root / 'downloads' / Path(package['Filename']).name
+    if not archive.exists():
+        base_url = package.get('BaseURL', 'https://deb.debian.org/debian/')
+        urllib.request.urlretrieve(base_url + package['Filename'], archive)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != package['SHA256']:
+        raise SystemExit(f'Checksum mismatch: {archive}')
+    unpack = subprocess.Popen(['ar', 'p', str(archive), 'data.tar.xz'], stdout=subprocess.PIPE)
+    subprocess.run(['tar', '-xJf', '-', '-C', str(sysroot)], stdin=unpack.stdout, check=True)
+    unpack.stdout.close()
+    if unpack.wait():
+        raise SystemExit(f'Failed to extract {archive}')
+
+# Resolve absolute loader links inside the extracted sysroot.
+for path in sysroot.rglob('*'):
+    if path.is_symlink() and os.readlink(path).startswith('/'):
+        target = str(sysroot) + os.readlink(path)
+        path.unlink()
+        path.symlink_to(os.path.relpath(target, path.parent))
+
+sources = [
+    ('https://www.openssl.org/source/openssl-3.5.4.tar.gz', 'openssl.tar.gz',
+     '967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99'),
+    ('https://curl.se/download/curl-8.23.0.tar.xz', 'curl.tar.xz',
+     '8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5'),
+]
+for url, filename, digest in sources:
+    archive = root / 'downloads' / filename
+    if not archive.exists():
+        urllib.request.urlretrieve(url, archive)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+        raise SystemExit(f'Checksum mismatch: {archive}')
 PY
 cr_cc="clang --sysroot=$cr_deps/sysroot --gcc-toolchain=$cr_deps/sysroot/usr"
 if [[ ! -f "$cr_deps/static/lib/libcrypto.a" ]]; then

@@ -27,3 +27,7 @@ release-*/
 !tests/linux64_steam_protobuf_smoke.cpp
 !tests/linux_kv64_resolver_tests.cpp
 !tests/linux_vtable_probe.cpp
+
+!tests/native_binary_tests.cpp
+!tests/linux_kv_tree_tests.cpp
+!tests/deployer_file_tests.cpp

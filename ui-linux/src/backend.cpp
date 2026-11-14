@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "utils.h"
+#include "native_binary.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -116,7 +117,7 @@ void Backend::detectSteamPath()
 
     m_deployed = false;
     QString crPath = crDataDir() + "/cloud_redirect.so";
-    m_deployed = QFile::exists(crPath);
+    m_deployed = NativeBinary::compatible(crPath, xdgDataHome() + "/SLSsteam/SLSsteam.so");
 
     // Parse account ID from loginusers.vdf (MostRecent > AutoLogin > Timestamp)
     QString loginUsersPath = m_steamPath + "/config/loginusers.vdf";
@@ -2167,7 +2168,7 @@ QVariantMap Backend::checkProviderCredentials(const QString &provider) const
     return out;
 }
 
-// Locate the deployed CLI (crDataDir()/cloud_redirect_cli). It's a 32-bit
+// Locate the deployed CLI (crDataDir()/cloud_redirect_cli). It matches the injected library's architecture and is a
 // binary run on the host via flatpak-spawn, so resolve the host path.
 QString Backend::cliExecutablePath() const
 {

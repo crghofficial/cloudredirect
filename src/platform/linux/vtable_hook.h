@@ -21,6 +21,9 @@ namespace VtableHook
         size_t slotIndex;
     };
 
+    // Copy readable process memory without dereferencing an untrusted pointer.
+    bool ReadMemory(const void* address, void* output, size_t size);
+
     // Find steamclient.so in memory via /proc/self/maps.
     // Returns base address, sets size. Returns 0 on failure.
     uintptr_t FindSteamclient(size_t& outSize);

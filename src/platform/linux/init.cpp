@@ -279,8 +279,8 @@ static void DoInit()
 
 
 
-static sigjmp_buf g_crashJmpBuf;
-static volatile sig_atomic_t g_inScan = 0;
+static thread_local sigjmp_buf g_crashJmpBuf;
+static thread_local volatile sig_atomic_t g_inScan = 0;
 
 static void ScanCrashHandler(int sig)
 {

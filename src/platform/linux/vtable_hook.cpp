@@ -19,11 +19,9 @@ static constexpr const char RTTI_NAME[] = "30CClientUnifiedServiceTransport";
 
 struct MapRange { uintptr_t start; uintptr_t end; };
 static std::vector<MapRange> g_readableRanges;
-static int g_readableCount = 0;
 static std::vector<MapRange> g_writableRanges;
-static int g_writableCount = 0;
 
-// Probe readability via write() to /dev/null. Used before g_readableRanges is populated.
+// Used before the Steam mapping inventory has been populated.
 static bool CanReadMemory(const void* addr, size_t len);
 
 // Walk backward page-by-page to find ELF magic (true load base).
@@ -60,8 +58,6 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
     uintptr_t labeledMin = 0;
     uintptr_t labeledMax = 0;
-    g_readableCount = 0;
-    g_writableCount = 0;
     g_readableRanges.clear();
     g_writableRanges.clear();
     char line[512];
@@ -138,19 +134,17 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
         if (perms[0] == 'r')
         {
             g_readableRanges.push_back({start_addr, end_addr});
-            g_readableCount++;
         }
         if (perms[0] == 'r' && perms[1] == 'w')
         {
             g_writableRanges.push_back({start_addr, end_addr});
-            g_writableCount++;
         }
     }
     fclose(f);
 
     outSize = labeledMax - base;
-    Log::Info("steamclient.so base=%p end=%p size=0x%zx (%d readable, %d writable ranges)", 
-              (void*)base, (void*)labeledMax, outSize, g_readableCount, g_writableCount);
+    Log::Info("steamclient.so base=%p end=%p size=0x%zx (%zu readable, %zu writable ranges)",
+              (void*)base, (void*)labeledMax, outSize, g_readableRanges.size(), g_writableRanges.size());
     Log::Debug("labeledMin=%p labeledMax=%p scanWindow=[%p, %p]",
                (void*)labeledMin, (void*)labeledMax, (void*)scanLo, (void*)scanHi);
     return base;
@@ -158,8 +152,19 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
 // /dev/null does not dereference the write buffer, so write() is not a memory
 // probe. Ask the kernel to copy from our address space and reject partial reads.
+bool VtableHook::ReadMemory(const void* address, void* output, size_t size)
+{
+    if (size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(address))
+        return false;
+    iovec local{output, size};
+    iovec remote{const_cast<void*>(address), size};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+}
+
 static bool CanReadMemory(const void* addr, size_t len)
 {
+    if (len > UINTPTR_MAX - reinterpret_cast<uintptr_t>(addr))
+        return false;
     char scratch[4096];
     size_t offset = 0;
     while (offset < len) {
@@ -177,7 +182,7 @@ static bool CanReadMemory(const void* addr, size_t len)
 static const uint8_t* FindBytes(const void* needle, size_t needleLen,
                                 uintptr_t steamBase, size_t steamSize)
 {
-    for (int r = 0; r < g_readableCount; r++)
+    for (size_t r = 0; r < g_readableRanges.size(); r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -206,7 +211,7 @@ static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
         uintptr_t target = (pass == 0) ? primary : fallback;
         if (pass == 1 && primary == fallback) break;  // same value, no second pass
 
-        for (int r = 0; r < g_readableCount; r++)
+        for (size_t r = 0; r < g_readableRanges.size(); r++)
         {
             if (g_readableRanges[r].end <= steamBase ||
                 g_readableRanges[r].start >= steamBase + steamSize)
@@ -248,8 +253,8 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     if (!nameField)
     {
         Log::Error("typeinfo for CClientUnifiedServiceTransport not found");
-        Log::Debug("  searched for 0x%zx (relocated) and 0x%zx (unrelocated) across %d ranges",
-                   (size_t)rttiStrAddr, (size_t)rttiStrVaddr, g_readableCount);
+        Log::Debug("  searched for 0x%zx (relocated) and 0x%zx (unrelocated) across %zu ranges",
+                   (size_t)rttiStrAddr, (size_t)rttiStrVaddr, g_readableRanges.size());
         return nullptr;
     }
     const uintptr_t* typeinfo = nameField - 1;  // typeinfo starts one slot before name
@@ -281,7 +286,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
 
     // Find vtable: scan for [offset_to_top=0, typeinfo_ptr] header
     void** vtableFuncs = nullptr;
-    for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
+    for (size_t r = 0; r < g_readableRanges.size() && !vtableFuncs; r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -297,7 +302,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
             if (*p == 0 && *(p + 1) == typeinfoAddr)
             {
                 vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 2));
-                Log::Debug("Found vtable at %p (header at %p) in range %d",
+                Log::Debug("Found vtable at %p (header at %p) in range %zu",
                            vtableFuncs, p, r);
                 break;
             }
@@ -418,7 +423,10 @@ static bool IsWithinSteamclient(uintptr_t ptr, uintptr_t steamBase, size_t steam
 
 static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr_t steamBase, size_t steamSize)
 {
-    uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slotIndex]);
+    void* function = nullptr;
+    if (!VtableHook::ReadMemory(vtable + slotIndex, &function, sizeof(function)))
+        return false;
+    uintptr_t fn = reinterpret_cast<uintptr_t>(function);
     if (!IsWithinSteamclient(fn, steamBase, steamSize) || !CanReadMemory(reinterpret_cast<void*>(fn), 30))
         return false;
 
@@ -474,11 +482,15 @@ static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr
 
 static size_t ResolveCloudEnabledSlot(void** vtable, uintptr_t steamBase, size_t steamSize)
 {
+    size_t match = SIZE_MAX;
     for (size_t slot = 0; slot < 32; ++slot) {
-        if (IsLikelyAppCloudEnabledSlot(vtable, slot, steamBase, steamSize))
-            return slot;
+        if (!IsLikelyAppCloudEnabledSlot(vtable, slot, steamBase, steamSize))
+            continue;
+        if (match != SIZE_MAX)
+            return SIZE_MAX;
+        match = slot;
     }
-    return SIZE_MAX;
+    return match;
 }
 
 void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize)
@@ -510,7 +522,7 @@ void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize
 
     // Find vtable: [offset_to_top=0, typeinfo_ptr]
     void** vtableFuncs = nullptr;
-    for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
+    for (size_t r = 0; r < g_readableRanges.size() && !vtableFuncs; r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -606,7 +618,7 @@ void** VtableHook::FindVtableByRTTIName(const char* mangledName,
     }
 
     // 4) vtable: scan for [offset_to_top=0, typeinfo_ptr] header.
-    for (int r = 0; r < g_readableCount; r++)
+    for (size_t r = 0; r < g_readableRanges.size(); r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -641,7 +653,7 @@ void* VtableHook::FindGlobalWithVtable(void* vtablePtr,
     uintptr_t target = reinterpret_cast<uintptr_t>(vtablePtr);
 
     // Default instances live in writable .data/.bss. Scan writable ranges.
-    for (int r = 0; r < g_writableCount; r++)
+    for (size_t r = 0; r < g_writableRanges.size(); r++)
     {
         if (g_writableRanges[r].end <= steamBase ||
             g_writableRanges[r].start >= steamBase + steamSize)

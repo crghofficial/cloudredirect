@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 // Opt-in, offline smoke test against the user's exact Steam ELF. This loads a
 // separate library instance and creates one protobuf message; it never attaches
 // to Steam, creates a Steam pipe, logs in, or accesses any saves/cloud provider.

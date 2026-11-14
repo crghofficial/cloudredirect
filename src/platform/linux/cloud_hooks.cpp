@@ -110,6 +110,7 @@ static int ParseFromArray64Adapter(void* msg, const void* data, int len) {
 }
 #endif
 
+#if !defined(__x86_64__)
 static sigjmp_buf g_protoJmpBuf;
 static volatile sig_atomic_t g_inProtoCall = 0;
 
@@ -142,6 +143,8 @@ private:
     struct sigaction m_oldSegv = {};
     struct sigaction m_oldBus = {};
 };
+
+#endif // legacy i386 crash recovery
 
 // Signature patterns for runtime resolution
 //
@@ -304,12 +307,14 @@ static std::vector<uint8_t> SerializeMessage(void* msg) {
     uintptr_t* vtable = *reinterpret_cast<uintptr_t**>(msg);
     if (!vtable || !vtable[9]) return {};
     using ByteSizeFn = size_t(*)(void*);
+#if !defined(__x86_64__)
     ProtoCrashGuard guard;
     int sig = sigsetjmp(g_protoJmpBuf, 1);
     if (sig != 0) {
         LOG("[Hook] SerializeToArray helper crashed with signal %d", sig);
         return {};
     }
+#endif
 
     size_t size = reinterpret_cast<ByteSizeFn>(vtable[9])(msg);
     if (size == 0 || size > 64 * 1024 * 1024) return {};
@@ -328,12 +333,14 @@ static std::vector<uint8_t> SerializeMessage(void* msg) {
 static bool ParseIntoMessage(void* msg, const uint8_t* data, size_t len) {
     if (!msg || !g_parseFromArray || !data || len == 0) return false;
     if (len > (size_t)INT_MAX) return false;
+#if !defined(__x86_64__)
     ProtoCrashGuard guard;
     int sig = sigsetjmp(g_protoJmpBuf, 1);
     if (sig != 0) {
         LOG("[Hook] ParseFromArray helper crashed with signal %d while parsing %zu bytes", sig, len);
         return false;
     }
+#endif
     return g_parseFromArray(msg, data, (int)len) != 0;
 }
 

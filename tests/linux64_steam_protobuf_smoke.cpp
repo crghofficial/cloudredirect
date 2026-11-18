@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <dlfcn.h>
+#include <string_view>
 
 namespace Log {
 void Write(const char *fmt, ...) {
@@ -22,7 +23,7 @@ void Write(const char *fmt, ...) {
 } // namespace Log
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
+    if (argc != 2 || argv[1][0] != '/') {
         fprintf(stderr, "Usage: %s /absolute/path/to/steamclient.so\n", argv[0]);
         return 77;
     }
@@ -30,8 +31,25 @@ int main(int argc, char **argv) {
     if (!file)
         return 1;
     std::string image((std::istreambuf_iterator<char>(file)), {});
-    const std::string expected = "53bdabbbb63fff0146a459f1f40dc9208661f329810557c462404ba52318bf11";
-    if (crypto::Sha256Hex(image) != expected) {
+    struct Fixture {
+        std::string_view sha256;
+        uintptr_t requestVtable;
+    };
+    static constexpr Fixture fixtures[] = {
+        // 1792618285
+        {"53bdabbbb63fff0146a459f1f40dc9208661f329810557c462404ba52318bf11", 0x31dc390},
+        // 1794536281
+        {"dab8df0daa27ffa6594ef5d6bc8cf707f37990220628f1f249fb30f4d88ade91", 0x31dc450},
+    };
+    const auto hash = crypto::Sha256Hex(image);
+    uintptr_t requestVtable = 0;
+    for (const auto& fixture : fixtures) {
+        if (hash == fixture.sha256) {
+            requestVtable = fixture.requestVtable;
+            break;
+        }
+    }
+    if (!requestVtable) {
         fprintf(stderr, "Unsupported fixture identity; known vtable RVA will not be used\n");
         return 77;
     }
@@ -46,7 +64,7 @@ int main(int argc, char **argv) {
     assert(CloudHooks::ResolveProtobufHelpers(info.dli_fbase, image.size()));
 
     // Real CCloud_GetAppFileChangelist_Request, identified by ELF RTTI relocs.
-    auto *vtable = reinterpret_cast<uintptr_t *>(base + 0x31dc390);
+    auto *vtable = reinterpret_cast<uintptr_t *>(base + requestVtable);
     struct {
         uintptr_t *vtable;
     } prototype{vtable};

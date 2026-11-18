@@ -1,6 +1,7 @@
 #include "vtable_hook.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
@@ -20,6 +21,9 @@ static constexpr const char RTTI_NAME[] = "30CClientUnifiedServiceTransport";
 struct MapRange { uintptr_t start; uintptr_t end; };
 static std::vector<MapRange> g_readableRanges;
 static std::vector<MapRange> g_writableRanges;
+#if defined(__x86_64__)
+static std::vector<MapRange> g_executableRanges;
+#endif
 
 // Used before the Steam mapping inventory has been populated.
 static bool CanReadMemory(const void* addr, size_t len);
@@ -60,6 +64,9 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
     uintptr_t labeledMax = 0;
     g_readableRanges.clear();
     g_writableRanges.clear();
+#if defined(__x86_64__)
+    g_executableRanges.clear();
+#endif
     char line[512];
 
     while (fgets(line, sizeof(line), f))
@@ -131,6 +138,10 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
         if (end_addr <= scanLo || start_addr >= scanHi) continue;
 
+#if defined(__x86_64__)
+        if (perms[2] == 'x' && start_addr < labeledMax && end_addr > base)
+            g_executableRanges.push_back({std::max(start_addr, base), std::min(end_addr, labeledMax)});
+#endif
         if (perms[0] == 'r')
         {
             g_readableRanges.push_back({start_addr, end_addr});
@@ -232,6 +243,40 @@ static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
     return nullptr;
 }
 
+#if defined(__x86_64__)
+static void** FindTransportTable(uintptr_t typeinfo, uintptr_t base, size_t size)
+{
+    void** match = nullptr;
+    for (const auto& range : g_readableRanges) {
+        const auto begin = std::max(range.start, base);
+        const auto end = std::min(range.end, base + size);
+        if (end <= begin || end - begin < 11 * sizeof(uintptr_t))
+            continue;
+        const auto first = (begin + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
+        for (auto address = first; address <= end - 11 * sizeof(uintptr_t); address += sizeof(uintptr_t)) {
+            const auto* header = reinterpret_cast<const uintptr_t*>(address);
+            if (header[0] != 0 || header[1] != typeinfo)
+                continue;
+
+            auto** table = reinterpret_cast<void**>(address + 2 * sizeof(uintptr_t));
+            uintptr_t slots[9];
+            if (!VtableHook::ReadMemory(table, slots, sizeof(slots)))
+                continue;
+            const auto executable = [](uintptr_t entry) {
+                return std::any_of(g_executableRanges.begin(), g_executableRanges.end(),
+                    [entry](const MapRange& code) { return entry >= code.start && entry < code.end; });
+            };
+            if (!executable(slots[5]) || !executable(slots[7]) || !executable(slots[8]))
+                continue;
+            if (match)
+                return nullptr;
+            match = table;
+        }
+    }
+    return match;
+}
+#endif
+
 void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
 {
     const size_t nameLen = strlen(RTTI_NAME);
@@ -285,6 +330,13 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     }
 
     // Find vtable: scan for [offset_to_top=0, typeinfo_ptr] header
+#if defined(__x86_64__)
+    void** vtableFuncs = FindTransportTable(typeinfoAddr, steamBase, steamSize);
+    if (!vtableFuncs) {
+        Log::Error("No unique CClientUnifiedServiceTransport vtable with executable slots");
+        return nullptr;
+    }
+#else
     void** vtableFuncs = nullptr;
     for (size_t r = 0; r < g_readableRanges.size() && !vtableFuncs; r++)
     {
@@ -330,6 +382,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
             return nullptr;
         }
     }
+#endif
 
     Log::Info("CClientUnifiedServiceTransport vtable at %p (offset 0x%zx)",
               vtableFuncs, reinterpret_cast<uintptr_t>(vtableFuncs) - steamBase);

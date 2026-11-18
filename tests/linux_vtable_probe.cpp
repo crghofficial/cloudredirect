@@ -17,7 +17,7 @@ extern "C" bool hook_IsCloudEnabledForApp(void *, unsigned) {
     return false;
 }
 int main(int argc, char **argv) {
-    if (argc != 2)
+    if (argc > 2)
         return 2;
     // Reject unreadable pointers and boundary-spanning reads without a signal.
     auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
@@ -30,6 +30,29 @@ int main(int argc, char **argv) {
         CanReadMemory(static_cast<char *>(area) + page - 1, 2) || CanReadMemory((void *)1, 4))
         return 4;
     munmap(area, page * 2);
+
+    // A header alone is insufficient: the three hook slots must point into
+    // executable Steam mappings and exactly one valid table must match.
+    uintptr_t tables[22] = {};
+    const auto begin = reinterpret_cast<uintptr_t>(tables);
+    constexpr uintptr_t typeinfo = 1;
+    constexpr uintptr_t executable = 0x123400;
+    g_readableRanges = {{begin, begin + sizeof(tables)}};
+    g_executableRanges = {{executable, executable + 16}};
+    tables[1] = typeinfo;
+    tables[7] = tables[9] = tables[10] = executable;
+    if (FindTransportTable(typeinfo, begin, sizeof(tables)) != reinterpret_cast<void**>(tables + 2))
+        return 10;
+    tables[10] = begin;
+    if (FindTransportTable(typeinfo, begin, sizeof(tables)))
+        return 11;
+    tables[10] = executable;
+    memcpy(tables + 11, tables, 11 * sizeof(uintptr_t));
+    if (FindTransportTable(typeinfo, begin, sizeof(tables)))
+        return 12;
+    if (argc == 1)
+        return 0;
+
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
@@ -44,6 +67,8 @@ int main(int argc, char **argv) {
     if (!vt || !rs)
         return 7;
     auto slot = ResolveCloudEnabledSlot(rs, base, size);
+    if (slot == SIZE_MAX)
+        return 13;
     // Cooperate with an existing SLSsteam five-byte entry detour, but reject
     // changed body instructions rather than trusting the vtable slot number.
     uint8_t method[40];

@@ -35,10 +35,10 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 static VtableHook::VtableInfo g_vtableInfo{};
 static VtableHook::CloudEnabledHookInfo g_cloudEnabledInfo{};
 static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_hookAttempted{false};
 static std::atomic<bool> g_logInitialized{false};
 static pthread_t g_initThread{};
-static std::atomic<bool> g_initThreadDone{false};
+static bool g_initThreadStarted = false;
+static std::atomic<bool> g_stopInit{false};
 
 // Raw diagnostic logging (survives even if C++ runtime is broken)
 
@@ -220,6 +220,9 @@ static void DoInit()
     if (!pbOk)
         Log::Error("Protobuf helpers not fully resolved -- cloud RPCs may fail");
 #endif
+
+    if (g_stopInit.load(std::memory_order_acquire))
+        return;
 
     DebugLog("[CR] DoInit: saving originals\n");
     CloudHooks::SetOriginals(vtable[5], vtable[7], vtable[8]);
@@ -555,15 +558,17 @@ static void* DeferredInitThread(void*)
     // Poll for steamclient.so -- under LD_PRELOAD we load before Steam has
     // mapped steamclient, so a fixed delay is insufficient.
     DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
-    for (int i = 0; i < 20; i++) {  // up to 10 seconds
-        if (SteamclientMapped()) break;
-        usleep(500000);
+    for (int i = 0; !SteamclientMapped(); ++i) {
+        if (g_stopInit.load(std::memory_order_acquire))
+            return nullptr;
+        if (i == 100) {
+            DebugLog("[CR] DeferredInit: launcher process has no steamclient; leaving preload for runtime child\n");
+            return nullptr;
+        }
+        usleep(100000);
     }
-    if (!SteamclientMapped()) {
-        DebugLog("[CR] DeferredInit: launcher process has no steamclient; leaving preload for runtime child\n");
-        g_initThreadDone.store(true, std::memory_order_release);
+    if (g_stopInit.load(std::memory_order_acquire))
         return nullptr;
-    }
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -592,7 +597,6 @@ static void* DeferredInitThread(void*)
         InstallCrashDumpHandler();
     }
 
-    g_initThreadDone.store(true, std::memory_order_release);
     return nullptr;
 }
 
@@ -609,41 +613,26 @@ static void OnLoad()
     DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");
     Log::Info("cloud_redirect.so active in process 'steam' (pid=%d)", getpid());
 
-    bool expected = false;
-    if (g_hookAttempted.compare_exchange_strong(expected, true))
-    {
-        if (pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) != 0) {
-            DebugLog("[CR] OnLoad: FAILED to create init thread\n");
-            g_initThreadDone.store(true, std::memory_order_release);
-        }
-    }
+    g_initThreadStarted = pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) == 0;
+    if (!g_initThreadStarted)
+        DebugLog("[CR] OnLoad: FAILED to create init thread\n");
 }
 
 __attribute__((destructor))
 static void OnUnload()
 {
-    DebugLog("[CR] OnUnload: shutting down\n");
-
-    // Wait for the init thread to finish so we don't unmap code it's executing.
-    // The thread runs for ~2s (usleep) + init time, so this is bounded.
-    if (g_hookAttempted.load(std::memory_order_acquire)) {
-        if (!g_initThreadDone.load(std::memory_order_acquire)) {
-            DebugLog("[CR] OnUnload: waiting for init thread\n");
-            pthread_join(g_initThread, nullptr);
-        }
+    // A launcher can exit without mapping steamclient. Cancel its poll before
+    // joining, so exit does not wait for the full bootstrap timeout.
+    if (g_initThreadStarted) {
+        g_stopInit.store(true, std::memory_order_release);
+        pthread_join(g_initThread, nullptr);
     }
-
-    // No-op (sync-icon state writer was never wired up); kept for contract.
-    CloudIntercept::FlushPendingSyncStates();
-
-    // Shut down cloud storage (signals workers, drains queue with timeout)
-    CloudStorage::Shutdown();
-
-    // Stop the HTTP server (joins accept + client threads)
-    HttpServer::Stop();
 
     if (g_initialized.load(std::memory_order_acquire))
     {
+        CloudIntercept::FlushPendingSyncStates();
+        CloudStorage::Shutdown();
+        HttpServer::Stop();
         CloudHooks::BeginShutdown();
         VtableHook::RemoveHooks(g_vtableInfo);
         VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo);

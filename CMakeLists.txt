@@ -550,6 +550,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
     target_include_directories(linux_vtable_probe PRIVATE src/common src/providers src/platform/linux)
     target_compile_definitions(linux_vtable_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=0 CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
     target_link_libraries(linux_vtable_probe PRIVATE dl pthread)
+    add_test(NAME linux_vtable_probe COMMAND linux_vtable_probe)
+
+    add_executable(linux_preload_lifecycle_tests tests/linux_preload_lifecycle_tests.cpp)
+    set_target_properties(linux_preload_lifecycle_tests PROPERTIES OUTPUT_NAME steam
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/preload-fixture")
+    target_link_libraries(linux_preload_lifecycle_tests PRIVATE dl)
+    add_dependencies(linux_preload_lifecycle_tests cloud_redirect)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/preload-fixture/config/CloudRedirect")
+    add_test(NAME linux_preload_lifecycle_tests COMMAND ${CMAKE_COMMAND} -E env
+        "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/preload-fixture/config"
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cloud_redirect>"
+        "LD_PRELOAD=$<TARGET_FILE_NAME:cloud_redirect>"
+        $<TARGET_FILE:linux_preload_lifecycle_tests> $<TARGET_FILE_NAME:cloud_redirect>)
+    set_tests_properties(linux_preload_lifecycle_tests PROPERTIES TIMEOUT 4)
+
+    add_executable(linux_external_library_tests tests/linux_external_library_tests.cpp
+        src/common/autocloud_scan.cpp src/common/vdf.cpp
+        src/platform/linux/platform_linux.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_external_library_tests PRIVATE src/common src/platform/linux)
+    target_compile_options(linux_external_library_tests PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(linux_external_library_tests PRIVATE -Wl,--gc-sections)
+    add_test(NAME linux_external_library_tests COMMAND linux_external_library_tests)
 endif()
 
 # ── UI (Windows only) ───────────────────────────────────────────────────

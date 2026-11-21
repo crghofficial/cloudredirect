@@ -10,6 +10,8 @@ class Deployer : public QObject
     Q_PROPERTY(bool slssteamInstalled READ slssteamInstalled NOTIFY checkCompleted)
     Q_PROPERTY(bool headcrabInstalled READ headcrabInstalled NOTIFY checkCompleted)
     Q_PROPERTY(bool alreadyDeployed READ alreadyDeployed NOTIFY checkCompleted)
+    Q_PROPERTY(bool launcherConfigured READ launcherConfigured NOTIFY checkCompleted)
+    Q_PROPERTY(bool launcherRepairAvailable READ launcherRepairAvailable NOTIFY checkCompleted)
     Q_PROPERTY(bool updateAvailable READ updateAvailable NOTIFY checkCompleted)
     Q_PROPERTY(bool slsCloudBlocked READ slsCloudBlocked NOTIFY checkCompleted)
     Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusMessageChanged)
@@ -22,6 +24,8 @@ public:
     bool slssteamInstalled() const;
     bool headcrabInstalled() const;
     bool alreadyDeployed() const;
+    bool launcherConfigured() const { return m_launcherConfigured; }
+    bool launcherRepairAvailable() const { return m_launcherRepairAvailable; }
     bool updateAvailable() const;
     bool slsCloudBlocked() const;
     QString statusMessage() const;
@@ -31,6 +35,7 @@ public:
     Q_INVOKABLE void checkPrerequisites();
     Q_INVOKABLE bool deploy();
     Q_INVOKABLE bool undeploy();
+    Q_INVOKABLE bool repairLauncher();
     Q_INVOKABLE bool update();
     Q_INVOKABLE bool purgeAll();
 
@@ -40,8 +45,14 @@ signals:
     void deployCompleted(bool success);
 
 private:
+    bool installBundledFiles();
+    bool configureLauncher();
+
     bool m_slssteamInstalled = false;
     bool m_headcrabInstalled = false;
+    bool m_launcherConfigured = false;
+    bool m_launcherRepairAvailable = false;
+    QString m_launcherPath;
     bool m_alreadyDeployed = false;
     bool m_updateAvailable = false;
     bool m_slsCloudBlocked = true;

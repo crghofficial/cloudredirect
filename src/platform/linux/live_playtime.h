@@ -25,7 +25,7 @@ bool Resolve(uintptr_t steamclientBase, size_t steamclientSize, ParseFromArrayFn
 // playtime write (post-logon refresh) records the active CUser pointer, which we
 // reuse to drive our own updates. Safe no-op if Resolve failed.
 bool InstallUserCapture();
-void RemoveUserCapture();
+bool RemoveUserCapture();
 
 // Apply a serialized CPlayer_GetLastPlayedTimes_Response (repeated Game games)
 // to the running client. No-op until the CUser has been captured. Must run on

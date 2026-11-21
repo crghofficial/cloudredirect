@@ -81,7 +81,8 @@ static std::vector<std::filesystem::path> GetSteamLibraryPaths(const std::string
             ++pos;
         }
         std::filesystem::path p = FileUtil::Utf8ToPath(path);
-        if (!std::filesystem::exists(p)) continue;
+        std::error_code ec;
+        if (!p.is_absolute() || !std::filesystem::is_directory(p, ec)) continue;
         bool seen = false;
         for (const auto& existing : paths) {
 #ifdef _WIN32
@@ -99,26 +100,48 @@ static std::vector<std::filesystem::path> GetSteamLibraryPaths(const std::string
     return paths;
 }
 
-static std::string FindGameInstallPath(const std::string& steamPath, uint32_t appId) {
+static std::filesystem::path FindAppManifest(const std::string& steamPath, uint32_t appId) {
     for (const auto& libPath : GetSteamLibraryPaths(steamPath)) {
         auto manifestPath = libPath / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
-        std::ifstream mf(manifestPath);
-        if (!mf) continue;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(manifestPath, ec)) return manifestPath;
+    }
+    return {};
+}
 
-        std::string line;
-        while (std::getline(mf, line)) {
-            auto pos = line.find("\"installdir\"");
-            if (pos == std::string::npos) continue;
-            auto q1 = line.rfind('"');
-            auto q2 = q1 == std::string::npos ? std::string::npos : line.rfind('"', q1 - 1);
-            if (q1 != std::string::npos && q2 != std::string::npos && q1 > q2) {
-                auto installDir = line.substr(q2 + 1, q1 - q2 - 1);
-                return FileUtil::PathToUtf8(libPath / "steamapps" / "common" / FileUtil::Utf8ToPath(installDir));
-            }
+static std::string FindGameInstallPath(const std::filesystem::path& manifest) {
+    if (manifest.empty()) return {};
+    std::ifstream mf(manifest);
+    std::string line;
+    while (std::getline(mf, line)) {
+        if (line.find("\"installdir\"") == std::string::npos) continue;
+        auto q1 = line.rfind('"');
+        auto q2 = q1 == std::string::npos ? std::string::npos : line.rfind('"', q1 - 1);
+        if (q2 != std::string::npos && q1 > q2) {
+            auto installDir = line.substr(q2 + 1, q1 - q2 - 1);
+            return FileUtil::PathToUtf8(manifest.parent_path() / "common" / FileUtil::Utf8ToPath(installDir));
         }
     }
     return {};
 }
+
+#ifndef _WIN32
+static std::filesystem::path GetProtonPrefix(const std::string& steamPath, uint32_t appId,
+                                             const std::filesystem::path& manifest) {
+    const auto suffix = std::filesystem::path("compatdata") / std::to_string(appId) / "pfx";
+    const auto primary = FileUtil::Utf8ToPath(steamPath) / "steamapps" / suffix;
+    if (manifest.empty()) return primary;
+
+    const auto inLibrary = manifest.parent_path() / suffix;
+    std::error_code error;
+    if (std::filesystem::is_directory(inLibrary, error)) return inLibrary;
+    if (!error || error == std::errc::no_such_file_or_directory) {
+        // Keep using an existing prefix left in the main library after a move.
+        if (std::filesystem::is_directory(primary, error)) return primary;
+    }
+    return inLibrary;
+}
+#endif
 
 static std::string GetAccountNameFromLoginUsers(const std::string& steamPath, uint32_t accountId) {
     auto vdfPath = FileUtil::Utf8ToPath(steamPath) / "config" / "loginusers.vdf";
@@ -267,7 +290,8 @@ static std::string BuildSteamCloudDocumentsPath(const std::string& steamPath,
 
 // Check compat.vdf to detect Proton (matches CCompatManager::LoadPlatformOverrideCache).
 static AutoCloudEffectivePlatform DetectEffectivePlatform(const std::string& steamPath, uint32_t appId,
-                                                          uint32_t accountId = 0) {
+                                                          uint32_t accountId,
+                                                          const std::filesystem::path& manifest) {
 #ifdef _WIN32
     return AutoCloudEffectivePlatform::Current;  // Windows is always Windows
 #else
@@ -323,8 +347,7 @@ static AutoCloudEffectivePlatform DetectEffectivePlatform(const std::string& ste
     }
 
     // No compat.vdf; check pfx as fallback.
-    std::string pfxPath = steamPath + "/steamapps/compatdata/" + std::to_string(appId) + "/pfx";
-    if (std::filesystem::exists(pfxPath, ec) && !ec) {
+    if (std::filesystem::is_directory(GetProtonPrefix(steamPath, appId, manifest), ec)) {
         LOG("DetectEffectivePlatform: app %u has compatdata/pfx folder = Proton (no compat.vdf)",
             appId);
         return AutoCloudEffectivePlatform::Windows;
@@ -609,12 +632,7 @@ static std::vector<uint8_t> ReadAndHashFile(const std::string& path,
 namespace AutoCloudScan {
 
 bool IsAppInstalled(const std::string& steamPath, uint32_t appId) {
-    for (const auto& libPath : GetSteamLibraryPaths(steamPath)) {
-        auto manifestPath = libPath / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
-        std::error_code ec;
-        if (std::filesystem::exists(manifestPath, ec) && !ec) return true;
-    }
-    return false;
+    return !FindAppManifest(steamPath, appId).empty();
 }
 
 ScanResult GetFileList(const std::string& steamPath,
@@ -622,7 +640,8 @@ ScanResult GetFileList(const std::string& steamPath,
     ScanResult outResult;
 
     // Detect effective platform: Proton games run as Windows effective platform
-    AutoCloudEffectivePlatform effectivePlatform = DetectEffectivePlatform(steamPath, appId, accountId);
+    const auto manifest = FindAppManifest(steamPath, appId);
+    AutoCloudEffectivePlatform effectivePlatform = DetectEffectivePlatform(steamPath, appId, accountId, manifest);
     LOG("GetAutoCloudFileList: app %u effective platform=%s",
         appId, effectivePlatform == AutoCloudEffectivePlatform::Windows ? "Windows" :
                effectivePlatform == AutoCloudEffectivePlatform::Linux ? "Linux" : "Current");
@@ -787,21 +806,21 @@ ScanResult GetFileList(const std::string& steamPath,
     std::string windowsHome = home + "/";
 
     // Proton: override Windows roots to compatdata prefix paths.
-    std::string compatdataBase = steamPath + "/steamapps/compatdata/" + std::to_string(appId);
-    std::string pfxBase = compatdataBase + "/pfx/drive_c/users/steamuser/";
     if (effectivePlatform == AutoCloudEffectivePlatform::Windows) {
+        const auto drive = FileUtil::PathToUtf8(GetProtonPrefix(steamPath, appId, manifest)) + "/drive_c/";
+        const auto pfxBase = drive + "users/steamuser/";
         LOG("GetAutoCloudFileList: app %u has Proton prefix, using compatdata paths", appId);
         localAppData = pfxBase + "Local Settings/Application Data/";
         localLow = pfxBase + "AppData/LocalLow/";
         roamingAppData = pfxBase + "Application Data/";
         myDocuments = pfxBase + "My Documents/";
         savedGames = pfxBase + "Saved Games/";
-        programData = compatdataBase + "/pfx/drive_c/ProgramData/";
+        programData = drive + "ProgramData/";
         windowsHome = pfxBase;
     }
 #endif
 
-    std::string gameInstallPath = FindGameInstallPath(steamPath, appId);
+    std::string gameInstallPath = FindGameInstallPath(manifest);
 
     // rootId values: Steam ERemoteStorageFileRoot. Triples in steam_root_ids.h.
     auto rootFor = [](const char* bare) -> const SteamRootIds::Entry& {
@@ -1218,7 +1237,8 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
     const std::string& steamPath, uint32_t appId, uint32_t accountId) {
     std::unordered_map<std::string, std::string> result;
 
-    AutoCloudEffectivePlatform effectivePlatform = DetectEffectivePlatform(steamPath, appId, accountId);
+    const auto manifest = FindAppManifest(steamPath, appId);
+    AutoCloudEffectivePlatform effectivePlatform = DetectEffectivePlatform(steamPath, appId, accountId, manifest);
 
 #ifdef _WIN32
     auto getEnvUtf8 = [](const wchar_t* name) -> std::string {
@@ -1313,15 +1333,15 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
     std::string programData = "/usr/share/";
     std::string windowsHome = home + "/";
 
-    std::string compatdataBase = steamPath + "/steamapps/compatdata/" + std::to_string(appId);
-    std::string pfxBase = compatdataBase + "/pfx/drive_c/users/steamuser/";
     if (effectivePlatform == AutoCloudEffectivePlatform::Windows) {
+        const auto drive = FileUtil::PathToUtf8(GetProtonPrefix(steamPath, appId, manifest)) + "/drive_c/";
+        const auto pfxBase = drive + "users/steamuser/";
         localAppData = pfxBase + "Local Settings/Application Data/";
         localLow = pfxBase + "AppData/LocalLow/";
         roamingAppData = pfxBase + "Application Data/";
         myDocuments = pfxBase + "My Documents/";
         savedGames = pfxBase + "Saved Games/";
-        programData = compatdataBase + "/pfx/drive_c/ProgramData/";
+        programData = drive + "ProgramData/";
         windowsHome = pfxBase;
     }
 
@@ -1345,7 +1365,7 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
     }
 #endif
 
-    std::string gameInstallPath = FindGameInstallPath(steamPath, appId);
+    std::string gameInstallPath = FindGameInstallPath(manifest);
     if (!gameInstallPath.empty()) {
 #ifdef _WIN32
         gameInstallPath += "\\";

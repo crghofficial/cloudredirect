@@ -1,11 +1,16 @@
 #include "vtable_hook.h"
 #include "log.h"
+#include "cloud_hooks.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <mutex>
+#include <vector>
+#include <elf.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -14,12 +19,14 @@ static constexpr const char RTTI_NAME[] = "30CClientUnifiedServiceTransport";
 
 // Steam's loader hides libraries from dl_iterate_phdr; parse /proc/self/maps.
 
-static struct { uintptr_t start; uintptr_t end; } g_readableRanges[64];
-static int g_readableCount = 0;
-static struct { uintptr_t start; uintptr_t end; } g_writableRanges[64];
-static int g_writableCount = 0;
+struct MapRange { uintptr_t start; uintptr_t end; };
+static std::vector<MapRange> g_readableRanges;
+static std::vector<MapRange> g_writableRanges;
+#if defined(__x86_64__)
+static std::vector<MapRange> g_executableRanges;
+#endif
 
-// Probe readability via write() to /dev/null. Used before g_readableRanges is populated.
+// Used before the Steam mapping inventory has been populated.
 static bool CanReadMemory(const void* addr, size_t len);
 
 // Walk backward page-by-page to find ELF magic (true load base).
@@ -56,8 +63,11 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
     uintptr_t labeledMin = 0;
     uintptr_t labeledMax = 0;
-    g_readableCount = 0;
-    g_writableCount = 0;
+    g_readableRanges.clear();
+    g_writableRanges.clear();
+#if defined(__x86_64__)
+    g_executableRanges.clear();
+#endif
     char line[512];
 
     while (fgets(line, sizeof(line), f))
@@ -95,6 +105,23 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
                   (void*)labeledMin, (void*)base, labeledMin - base);
     }
 
+#if defined(__x86_64__)
+    // The final PT_LOAD contains anonymous .bss past the last file-labelled
+    // mapping. Protobuf default instances and the engine global live there.
+    if (CanReadMemory(reinterpret_cast<void*>(base), sizeof(Elf64_Ehdr))) {
+        const auto* eh = reinterpret_cast<const Elf64_Ehdr*>(base);
+        if (eh->e_ident[EI_CLASS] == ELFCLASS64 && eh->e_phentsize == sizeof(Elf64_Phdr) &&
+            eh->e_phnum < 128 && eh->e_phoff < 0x10000 &&
+            CanReadMemory(reinterpret_cast<void*>(base + eh->e_phoff), eh->e_phnum * sizeof(Elf64_Phdr))) {
+            const auto* ph = reinterpret_cast<const Elf64_Phdr*>(base + eh->e_phoff);
+            for (size_t i = 0; i < eh->e_phnum; ++i)
+                if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < 0x40000000 && ph[i].p_memsz < 0x40000000 &&
+                    base + ph[i].p_vaddr + ph[i].p_memsz > labeledMax)
+                    labeledMax = base + ph[i].p_vaddr + ph[i].p_memsz;
+        }
+    }
+#endif
+
     // Capture readable mappings within +/-16 MiB of labeled span.
     // .data.rel.ro may be in anonymous mappings outside the labeled range.
     // Slot-pointer validation still uses the tight labeled span.
@@ -112,47 +139,62 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 
         if (end_addr <= scanLo || start_addr >= scanHi) continue;
 
-        if (perms[0] == 'r' && g_readableCount < 64)
+#if defined(__x86_64__)
+        if (perms[2] == 'x' && start_addr < labeledMax && end_addr > base)
+            g_executableRanges.push_back({std::max(start_addr, base), std::min(end_addr, labeledMax)});
+#endif
+        if (perms[0] == 'r')
         {
-            g_readableRanges[g_readableCount].start = start_addr;
-            g_readableRanges[g_readableCount].end = end_addr;
-            g_readableCount++;
+            g_readableRanges.push_back({start_addr, end_addr});
         }
-        if (perms[0] == 'r' && perms[1] == 'w' && g_writableCount < 64)
+        if (perms[0] == 'r' && perms[1] == 'w')
         {
-            g_writableRanges[g_writableCount].start = start_addr;
-            g_writableRanges[g_writableCount].end = end_addr;
-            g_writableCount++;
+            g_writableRanges.push_back({start_addr, end_addr});
         }
     }
     fclose(f);
 
     outSize = labeledMax - base;
-    Log::Info("steamclient.so base=%p end=%p size=0x%zx (%d readable, %d writable ranges)", 
-              (void*)base, (void*)labeledMax, outSize, g_readableCount, g_writableCount);
+    Log::Info("steamclient.so base=%p end=%p size=0x%zx (%zu readable, %zu writable ranges)",
+              (void*)base, (void*)labeledMax, outSize, g_readableRanges.size(), g_writableRanges.size());
     Log::Debug("labeledMin=%p labeledMax=%p scanWindow=[%p, %p]",
                (void*)labeledMin, (void*)labeledMax, (void*)scanLo, (void*)scanHi);
     return base;
 }
 
-// Safe memory probe using write() to /dev/null -- avoids SIGSEGV
+// /dev/null does not dereference the write buffer, so write() is not a memory
+// probe. Ask the kernel to copy from our address space and reject partial reads.
+bool VtableHook::ReadMemory(const void* address, void* output, size_t size)
+{
+    if (size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(address))
+        return false;
+    iovec local{output, size};
+    iovec remote{const_cast<void*>(address), size};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+}
+
 static bool CanReadMemory(const void* addr, size_t len)
 {
-    static std::once_flag devnullOnce;
-    static int devnull = -1;
-    std::call_once(devnullOnce, []() {
-        devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    });
-    if (devnull < 0)
+    if (len > UINTPTR_MAX - reinterpret_cast<uintptr_t>(addr))
         return false;
-    return (write(devnull, addr, len) == (ssize_t)len);
+    char scratch[4096];
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = (len - offset > sizeof(scratch)) ? sizeof(scratch) : len - offset;
+        iovec local{scratch, chunk};
+        iovec remote{reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + offset), chunk};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != static_cast<ssize_t>(chunk))
+            return false;
+        offset += chunk;
+    }
+    return true;
 }
 
 // Scan readable ranges within steamclient for a byte sequence.
 static const uint8_t* FindBytes(const void* needle, size_t needleLen,
                                 uintptr_t steamBase, size_t steamSize)
 {
-    for (int r = 0; r < g_readableCount; r++)
+    for (size_t r = 0; r < g_readableRanges.size(); r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -181,7 +223,7 @@ static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
         uintptr_t target = (pass == 0) ? primary : fallback;
         if (pass == 1 && primary == fallback) break;  // same value, no second pass
 
-        for (int r = 0; r < g_readableCount; r++)
+        for (size_t r = 0; r < g_readableRanges.size(); r++)
         {
             if (g_readableRanges[r].end <= steamBase ||
                 g_readableRanges[r].start >= steamBase + steamSize)
@@ -201,6 +243,40 @@ static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
     }
     return nullptr;
 }
+
+#if defined(__x86_64__)
+static void** FindTransportTable(uintptr_t typeinfo, uintptr_t base, size_t size)
+{
+    void** match = nullptr;
+    for (const auto& range : g_readableRanges) {
+        const auto begin = std::max(range.start, base);
+        const auto end = std::min(range.end, base + size);
+        if (end <= begin || end - begin < 11 * sizeof(uintptr_t))
+            continue;
+        const auto first = (begin + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
+        for (auto address = first; address <= end - 11 * sizeof(uintptr_t); address += sizeof(uintptr_t)) {
+            const auto* header = reinterpret_cast<const uintptr_t*>(address);
+            if (header[0] != 0 || header[1] != typeinfo)
+                continue;
+
+            auto** table = reinterpret_cast<void**>(address + 2 * sizeof(uintptr_t));
+            uintptr_t slots[9];
+            if (!VtableHook::ReadMemory(table, slots, sizeof(slots)))
+                continue;
+            const auto executable = [](uintptr_t entry) {
+                return std::any_of(g_executableRanges.begin(), g_executableRanges.end(),
+                    [entry](const MapRange& code) { return entry >= code.start && entry < code.end; });
+            };
+            if (!executable(slots[5]) || !executable(slots[7]) || !executable(slots[8]))
+                continue;
+            if (match)
+                return nullptr;
+            match = table;
+        }
+    }
+    return match;
+}
+#endif
 
 void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
 {
@@ -223,8 +299,8 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     if (!nameField)
     {
         Log::Error("typeinfo for CClientUnifiedServiceTransport not found");
-        Log::Debug("  searched for 0x%zx (relocated) and 0x%zx (unrelocated) across %d ranges",
-                   (size_t)rttiStrAddr, (size_t)rttiStrVaddr, g_readableCount);
+        Log::Debug("  searched for 0x%zx (relocated) and 0x%zx (unrelocated) across %zu ranges",
+                   (size_t)rttiStrAddr, (size_t)rttiStrVaddr, g_readableRanges.size());
         return nullptr;
     }
     const uintptr_t* typeinfo = nameField - 1;  // typeinfo starts one slot before name
@@ -255,8 +331,15 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     }
 
     // Find vtable: scan for [offset_to_top=0, typeinfo_ptr] header
+#if defined(__x86_64__)
+    void** vtableFuncs = FindTransportTable(typeinfoAddr, steamBase, steamSize);
+    if (!vtableFuncs) {
+        Log::Error("No unique CClientUnifiedServiceTransport vtable with executable slots");
+        return nullptr;
+    }
+#else
     void** vtableFuncs = nullptr;
-    for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
+    for (size_t r = 0; r < g_readableRanges.size() && !vtableFuncs; r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -272,7 +355,7 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
             if (*p == 0 && *(p + 1) == typeinfoAddr)
             {
                 vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 2));
-                Log::Debug("Found vtable at %p (header at %p) in range %d",
+                Log::Debug("Found vtable at %p (header at %p) in range %zu",
                            vtableFuncs, p, r);
                 break;
             }
@@ -300,30 +383,13 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
             return nullptr;
         }
     }
+#endif
 
     Log::Info("CClientUnifiedServiceTransport vtable at %p (offset 0x%zx)",
               vtableFuncs, reinterpret_cast<uintptr_t>(vtableFuncs) - steamBase);
     Log::Debug("  slot5=%p  slot7=%p  slot8=%p",
                vtableFuncs[5], vtableFuncs[7], vtableFuncs[8]);
     return vtableFuncs;
-}
-
-static bool MakeWritable(void* addr, size_t len)
-{
-    long pageSize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pageSize - 1);
-    uintptr_t endAddr = reinterpret_cast<uintptr_t>(addr) + len;
-    size_t pageLen = ((endAddr - page) + (pageSize - 1)) & ~(pageSize - 1);
-    return mprotect(reinterpret_cast<void*>(page), pageLen, PROT_READ | PROT_WRITE) == 0;
-}
-
-static bool MakeReadOnly(void* addr, size_t len)
-{
-    long pageSize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pageSize - 1);
-    uintptr_t endAddr = reinterpret_cast<uintptr_t>(addr) + len;
-    size_t pageLen = ((endAddr - page) + (pageSize - 1)) & ~(pageSize - 1);
-    return mprotect(reinterpret_cast<void*>(page), pageLen, PROT_READ) == 0;
 }
 
 // Defined in cloud_hooks.cpp
@@ -336,52 +402,53 @@ extern "C" {
 
 bool VtableHook::InstallHooks(void** vtable, VtableInfo& info)
 {
-    info.vtable = vtable;
+    if (info.vtable) return false;
+    if (!info.protection.Capture(&vtable[5], 4 * sizeof(void*)))
+        return false;
     info.origSlot5 = vtable[5];
     info.origSlot7 = vtable[7];
     info.origSlot8 = vtable[8];
-
-    // The vtable lives in .data.rel.ro -- need to make it writable
-    void* slotBase = &vtable[5];
-    size_t span = reinterpret_cast<uintptr_t>(&vtable[8]) - reinterpret_cast<uintptr_t>(&vtable[5]) + 8;
-
-    if (!MakeWritable(slotBase, span))
-    {
+    // Record the patch before changing permissions or publishing any hook.
+    info.vtable = vtable;
+    if (!info.protection.MakeWritable()) {
         Log::Error("mprotect RW failed on vtable");
+        RemoveHooks(info);
         return false;
     }
 
-    vtable[5] = reinterpret_cast<void*>(&hook_BYieldingSend);
-    vtable[7] = reinterpret_cast<void*>(&hook_NotificationDirect);
-    vtable[8] = reinterpret_cast<void*>(&hook_SyncSend2);
-
-    // Restore read-only (non-fatal if it fails).
-    MakeReadOnly(slotBase, span);
-
+    __atomic_store_n(&vtable[5], reinterpret_cast<void*>(&hook_BYieldingSend), __ATOMIC_RELEASE);
+    __atomic_store_n(&vtable[7], reinterpret_cast<void*>(&hook_NotificationDirect), __ATOMIC_RELEASE);
+    __atomic_store_n(&vtable[8], reinterpret_cast<void*>(&hook_SyncSend2), __ATOMIC_RELEASE);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore vtable page permissions; rolling back");
+        RemoveHooks(info);
+        return false;
+    }
     Log::Info("Vtable hooks installed: slot5=%p slot7=%p slot8=%p",
               vtable[5], vtable[7], vtable[8]);
     return true;
 }
 
-void VtableHook::RemoveHooks(const VtableInfo& info)
+bool VtableHook::RemoveHooks(VtableInfo& info)
 {
-    if (!info.vtable) return;
-
-    void* slotBase = &info.vtable[5];
-    size_t span = reinterpret_cast<uintptr_t>(&info.vtable[8]) - reinterpret_cast<uintptr_t>(&info.vtable[5]) + 8;
-
-    if (MakeWritable(slotBase, span))
-    {
-        info.vtable[5] = info.origSlot5;
-        info.vtable[7] = info.origSlot7;
-        info.vtable[8] = info.origSlot8;
-        MakeReadOnly(slotBase, span);
-        Log::Info("Vtable hooks removed");
+    if (!info.vtable) return true;
+    if (!info.protection.MakeWritable()) {
+        Log::Error("mprotect RW failed during hook removal");
+        return false;
     }
-    else
-    {
-        Log::Warn("mprotect RW failed during hook removal");
+    void* expected = reinterpret_cast<void*>(&hook_BYieldingSend);
+    __atomic_compare_exchange_n(&info.vtable[5], &expected, info.origSlot5, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    expected = reinterpret_cast<void*>(&hook_NotificationDirect);
+    __atomic_compare_exchange_n(&info.vtable[7], &expected, info.origSlot7, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    expected = reinterpret_cast<void*>(&hook_SyncSend2);
+    __atomic_compare_exchange_n(&info.vtable[8], &expected, info.origSlot8, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore vtable page permissions during hook removal");
+        return false;
     }
+    info = {};
+    Log::Info("Vtable hooks removed");
+    return true;
 }
 
 static constexpr const char RTTI_REMOTE_STORAGE[] = "18CUserRemoteStorage";
@@ -393,11 +460,30 @@ static bool IsWithinSteamclient(uintptr_t ptr, uintptr_t steamBase, size_t steam
 
 static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr_t steamBase, size_t steamSize)
 {
-    uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slotIndex]);
+    void* function = nullptr;
+    if (!VtableHook::ReadMemory(vtable + slotIndex, &function, sizeof(function)))
+        return false;
+    uintptr_t fn = reinterpret_cast<uintptr_t>(function);
     if (!IsWithinSteamclient(fn, steamBase, steamSize) || !CanReadMemory(reinterpret_cast<void*>(fn), 30))
         return false;
 
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+
+#if defined(__x86_64__)
+    // Steam 1792618285, SysV ABI: appId is ESI. This method checks the per-app
+    // override tree at this+0x300 and then UFS external-file policy. Match both
+    // argument handling and that tree access, not a slot number alone.
+    static constexpr uint8_t prefix[] = {
+        0x85,0xf6,0x41,0x54,0x55,0x48,0x89,0xfd,0x53,0x89,0xf3,0x0f,0x84
+    };
+    static constexpr uint8_t tree[] = {0x48,0x63,0x85,0x00,0x03,0x00,0x00,0x83,0xf8,0xff};
+    // SLSsteam may already own a five-byte entry detour. Its untouched
+    // instruction suffix still identifies this method; our saved original
+    // pointer preserves that existing detour for non-namespace apps.
+    const bool entryMatches = memcmp(p, prefix, sizeof(prefix)) == 0 ||
+        (p[0] == 0xe9 && memcmp(p + 5, prefix + 5, sizeof(prefix) - 5) == 0);
+    return entryMatches && memcmp(p + 17, tree, sizeof(tree)) == 0;
+#endif
 
     // Pattern A (older builds): args passed via esp offsets
     //   +0:  55 57 56 53 E8 ?? ?? ?? ??  (push ebp/edi/esi/ebx + call PIC thunk)
@@ -433,11 +519,15 @@ static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr
 
 static size_t ResolveCloudEnabledSlot(void** vtable, uintptr_t steamBase, size_t steamSize)
 {
+    size_t match = SIZE_MAX;
     for (size_t slot = 0; slot < 32; ++slot) {
-        if (IsLikelyAppCloudEnabledSlot(vtable, slot, steamBase, steamSize))
-            return slot;
+        if (!IsLikelyAppCloudEnabledSlot(vtable, slot, steamBase, steamSize))
+            continue;
+        if (match != SIZE_MAX)
+            return SIZE_MAX;
+        match = slot;
     }
-    return SIZE_MAX;
+    return match;
 }
 
 void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize)
@@ -469,7 +559,7 @@ void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize
 
     // Find vtable: [offset_to_top=0, typeinfo_ptr]
     void** vtableFuncs = nullptr;
-    for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
+    for (size_t r = 0; r < g_readableRanges.size() && !vtableFuncs; r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -565,7 +655,7 @@ void** VtableHook::FindVtableByRTTIName(const char* mangledName,
     }
 
     // 4) vtable: scan for [offset_to_top=0, typeinfo_ptr] header.
-    for (int r = 0; r < g_readableCount; r++)
+    for (size_t r = 0; r < g_readableRanges.size(); r++)
     {
         if (g_readableRanges[r].end <= steamBase ||
             g_readableRanges[r].start >= steamBase + steamSize)
@@ -600,7 +690,7 @@ void* VtableHook::FindGlobalWithVtable(void* vtablePtr,
     uintptr_t target = reinterpret_cast<uintptr_t>(vtablePtr);
 
     // Default instances live in writable .data/.bss. Scan writable ranges.
-    for (int r = 0; r < g_writableCount; r++)
+    for (size_t r = 0; r < g_writableRanges.size(); r++)
     {
         if (g_writableRanges[r].end <= steamBase ||
             g_writableRanges[r].start >= steamBase + steamSize)
@@ -630,40 +720,50 @@ void* VtableHook::FindGlobalWithVtable(void* vtablePtr,
 
 bool VtableHook::InstallCloudEnabledHook(void** vtable, CloudEnabledHookInfo& info)
 {
+    if (info.vtable) return false;
     size_t slotIndex = ResolveCloudEnabledSlot(vtable, 0, UINTPTR_MAX);
-    if (slotIndex == SIZE_MAX)
-    {
+    if (slotIndex == SIZE_MAX) {
         Log::Error("Could not resolve CUserRemoteStorage cloud-enabled slot");
         return false;
     }
-
-    info.vtable = vtable;
+    if (!info.protection.Capture(&vtable[slotIndex], sizeof(void*)))
+        return false;
     info.slotIndex = slotIndex;
     info.origSlot = vtable[slotIndex];
-
-    void* slotAddr = &vtable[slotIndex];
-    if (!MakeWritable(slotAddr, sizeof(void*)))
-    {
+    info.vtable = vtable;
+    if (!info.protection.MakeWritable()) {
         Log::Error("mprotect RW failed on RemoteStorage vtable slot %zu", slotIndex);
+        RemoveCloudEnabledHook(info);
         return false;
     }
 
-    vtable[slotIndex] = reinterpret_cast<void*>(&hook_IsCloudEnabledForApp);
-    MakeReadOnly(slotAddr, sizeof(void*));
-
+    // Calls can arrive as soon as the slot is replaced.
+    CloudHooks::SetOriginalIsCloudEnabled(info.origSlot);
+    __atomic_store_n(&vtable[slotIndex], reinterpret_cast<void*>(&hook_IsCloudEnabledForApp), __ATOMIC_RELEASE);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore RemoteStorage page permissions; rolling back");
+        RemoveCloudEnabledHook(info);
+        return false;
+    }
     Log::Info("IsCloudEnabledForApp hook installed at slot %zu (orig=%p)", slotIndex, info.origSlot);
     return true;
 }
 
-void VtableHook::RemoveCloudEnabledHook(const CloudEnabledHookInfo& info)
+bool VtableHook::RemoveCloudEnabledHook(CloudEnabledHookInfo& info)
 {
-    if (!info.vtable) return;
-
-    void* slotAddr = &info.vtable[info.slotIndex];
-    if (MakeWritable(slotAddr, sizeof(void*)))
-    {
-        info.vtable[info.slotIndex] = info.origSlot;
-        MakeReadOnly(slotAddr, sizeof(void*));
-        Log::Info("IsCloudEnabledForApp hook removed");
+    if (!info.vtable) return true;
+    if (!info.protection.MakeWritable()) {
+        Log::Error("mprotect RW failed during RemoteStorage hook removal");
+        return false;
     }
+    void* expected = reinterpret_cast<void*>(&hook_IsCloudEnabledForApp);
+    __atomic_compare_exchange_n(&info.vtable[info.slotIndex], &expected, info.origSlot, false,
+                               __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore RemoteStorage page permissions during hook removal");
+        return false;
+    }
+    info = {};
+    Log::Info("IsCloudEnabledForApp hook removed");
+    return true;
 }

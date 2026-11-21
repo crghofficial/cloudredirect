@@ -51,6 +51,7 @@ qt_add_executable(cloud-redirect-ui
     src/main.cpp
     src/backend.cpp
     src/deployer.cpp
+    src/steam_launcher.cpp
     src/oauthservice.cpp
 )
 

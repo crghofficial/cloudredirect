@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include "memory_protection.h"
 
 namespace VtableHook
 {
@@ -12,6 +13,7 @@ namespace VtableHook
         void*  origSlot5;           // BYieldingSendMessageAndGetReply
         void*  origSlot7;           // NotificationDirect
         void*  origSlot8;           // SyncSend2
+        MemoryProtection protection;
     };
 
     struct CloudEnabledHookInfo
@@ -19,7 +21,11 @@ namespace VtableHook
         void** vtable;
         void*  origSlot;
         size_t slotIndex;
+        MemoryProtection protection;
     };
+
+    // Copy readable process memory without dereferencing an untrusted pointer.
+    bool ReadMemory(const void* address, void* output, size_t size);
 
     // Find steamclient.so in memory via /proc/self/maps.
     // Returns base address, sets size. Returns 0 on failure.
@@ -50,6 +56,6 @@ namespace VtableHook
     bool InstallCloudEnabledHook(void** vtable, CloudEnabledHookInfo& info);
 
     // Restore original vtable slots.
-    void RemoveHooks(const VtableInfo& info);
-    void RemoveCloudEnabledHook(const CloudEnabledHookInfo& info);
+    bool RemoveHooks(VtableInfo& info);
+    bool RemoveCloudEnabledHook(CloudEnabledHookInfo& info);
 }

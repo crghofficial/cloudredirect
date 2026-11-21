@@ -33,8 +33,11 @@
 #include <unistd.h>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cinttypes>
+#include <algorithm>
 
-// 32-bit Linux cdecl: all args on stack
+// Native Linux ABI: i386 cdecl or x86-64 SysV (this is the first argument).
 using BYieldingSend_t     = int(*)(void* pThis, const char* method, void* req, void* resp, int* flags);
 using NotificationDirect_t = int(*)(void* pThis, const char* method, void* body, int* flags);
 using SyncSend2_t         = int(*)(void* pThis, const char* method, void* buf, unsigned int bufLen, void* resp, int* flags);
@@ -44,7 +47,8 @@ static std::atomic<NotificationDirect_t> g_origNotificationDirect{nullptr};
 static std::atomic<SyncSend2_t>          g_origSyncSend2{nullptr};
 
 static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_shuttingDown{false};
+// Pass through to Steam until the entry point commits startup.
+static std::atomic<bool> g_shuttingDown{true};
 static std::atomic<int>  g_hookRefCount{0};
 static std::atomic<bool> g_statsSyncEnabled{true}; // set false by config before any stats init
 
@@ -96,6 +100,18 @@ using ParseFromArray_t   = int(*)(void* msg, const void* data, int len);
 static SerializeToArray_t g_serializeToArray = nullptr;
 static ParseFromArray_t   g_parseFromArray   = nullptr;
 
+#if defined(__x86_64__)
+// MessageLite::ParseFromArray returns bool in AL, not an int in EAX. Calling
+// it through the legacy int-returning pointer can mistake stale upper bits
+// for success. Keep the adapter for the existing optional helper interface.
+using ParseFromArray64_t = bool(*)(void*, const void*, int);
+static ParseFromArray64_t g_parseFromArray64 = nullptr;
+static int ParseFromArray64Adapter(void* msg, const void* data, int len) {
+    return g_parseFromArray64 && g_parseFromArray64(msg, data, len) ? 1 : 0;
+}
+#endif
+
+#if !defined(__x86_64__)
 static sigjmp_buf g_protoJmpBuf;
 static volatile sig_atomic_t g_inProtoCall = 0;
 
@@ -128,6 +144,8 @@ private:
     struct sigaction m_oldSegv = {};
     struct sigaction m_oldBus = {};
 };
+
+#endif // legacy i386 crash recovery
 
 // Signature patterns for runtime resolution
 //
@@ -163,6 +181,7 @@ static const uint8_t kParseArgLoads[] = {
 };
 
 static void* ScanForPattern(void* base, size_t size, const uint8_t* pattern, size_t patLen) {
+    if (!base || !pattern || !patLen || size < patLen) return nullptr;
     const uint8_t* p = (const uint8_t*)base;
     const uint8_t* end = p + size - patLen;
     for (; p <= end; ++p) {
@@ -171,7 +190,80 @@ static void* ScanForPattern(void* base, size_t size, const uint8_t* pattern, siz
     return nullptr;
 }
 
+#if defined(__x86_64__)
+// Scan only readable executable mappings. steamclient's PT_LOAD segments can
+// contain unmapped gaps; treating its entire min..max span as a byte array is
+// unsafe. Reject ambiguous matches rather than installing a guessed helper.
+static void* FindUniqueMappedPattern(void* base, size_t size,
+                                    const uint8_t* pattern, size_t patLen,
+                                    size_t tailOffset = 0,
+                                    const uint8_t* tail = nullptr, size_t tailLen = 0) {
+    if (!base || !size || !pattern || !patLen) return nullptr;
+    uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    if (size > UINTPTR_MAX - lo || tailLen > SIZE_MAX - tailOffset) return nullptr;
+    uintptr_t hi = lo + size;
+    size_t required = std::max(patLen, tailOffset + tailLen);
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return nullptr;
+    char line[1024];
+    void* found = nullptr;
+    bool ambiguous = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start = 0, end = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, perms) != 3 ||
+            perms[0] != 'r' || perms[2] != 'x') continue;
+        start = std::max(start, lo);
+        end = std::min(end, hi);
+        if (end <= start || end - start < required) continue;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(start);
+        const uint8_t* last = reinterpret_cast<const uint8_t*>(end - required);
+        for (; p <= last; ++p) {
+            if (memcmp(p, pattern, patLen) ||
+                (tailLen && memcmp(p + tailOffset, tail, tailLen))) continue;
+            if (found) { ambiguous = true; break; }
+            found = const_cast<uint8_t*>(p);
+        }
+        if (ambiguous) break;
+    }
+    fclose(maps);
+    return ambiguous ? nullptr : found;
+}
+#endif
+
 bool CloudHooks::ResolveProtobufHelpers(void* steamclientBase, size_t steamclientSize) {
+#if defined(__x86_64__)
+    // Observed in steamrt64 build 1792618285. Unlike the old i386 helper, the
+    // SysV implementation reads an 8-byte vtable and calls GetCachedSize at
+    // +0x50. No build-relative addresses are used at runtime.
+    static constexpr uint8_t serializeSig64[] = {
+        0x48,0x83,0xEC,0x18, 0x48,0x8B,0x07, 0x48,0x89,0x74,0x24,0x08,
+        0x48,0x89,0x3C,0x24, 0xFF,0x50,0x50, 0x48,0x8B,0x74,0x24,0x08,
+        0x48,0x8B,0x3C,0x24, 0x48,0x83,0xC4,0x18, 0x89,0xC2,0xE9
+    };
+    // ParseFromArray clears slot 5 (+0x28), then tail-calls the parser with
+    // mode 1. The adjacent ParsePartialFromArray has mode 3; the tail check
+    // explicitly distinguishes it, rather than accepting the shared prologue.
+    static constexpr uint8_t parseSig64[] = {
+        0x41,0x55,0x41,0x54,0x55,0x48,0x63,0xEA,0x48,0x85,0xED,0x79,0x1F
+    };
+    static constexpr uint8_t parseTail64[] = {
+        0x48,0x8B,0x07,0x49,0x89,0xFC,0x49,0x89,0xF5,0xFF,0x50,0x28,
+        0x4C,0x89,0xE2,0x4C,0x89,0xEF,0x48,0x89,0xEE,0xB9,0x01,0,0,0,
+        0x5D,0x41,0x5C,0x41,0x5D,0xE9
+    };
+    g_serializeToArray = reinterpret_cast<SerializeToArray_t>(
+        FindUniqueMappedPattern(steamclientBase, steamclientSize,
+                                serializeSig64, sizeof(serializeSig64)));
+    g_parseFromArray64 = reinterpret_cast<ParseFromArray64_t>(
+        FindUniqueMappedPattern(steamclientBase, steamclientSize,
+                                parseSig64, sizeof(parseSig64), 0x2C,
+                                parseTail64, sizeof(parseTail64)));
+    g_parseFromArray = g_parseFromArray64 ? &ParseFromArray64Adapter : nullptr;
+    LOG("[Hook] x86-64 protobuf helpers: serialize=%p parse=%p (unique executable matches)",
+        reinterpret_cast<void*>(g_serializeToArray), reinterpret_cast<void*>(g_parseFromArray64));
+    return g_serializeToArray && g_parseFromArray;
+#else
     // Find SerializeToArray by its unique 16-byte signature
     void* serialize = ScanForPattern(steamclientBase, steamclientSize, kSerializeSig, sizeof(kSerializeSig));
     if (serialize) {
@@ -206,39 +298,50 @@ bool CloudHooks::ResolveProtobufHelpers(void* steamclientBase, size_t steamclien
     }
 
     return g_serializeToArray != nullptr && g_parseFromArray != nullptr;
+#endif
 }
 
 static std::vector<uint8_t> SerializeMessage(void* msg) {
     if (!msg || !g_serializeToArray) return {};
 
     // vtable[9] = ByteSizeLong (offset +36 on 32-bit)
-    uint32_t* vtable = *(uint32_t**)msg;
+    uintptr_t* vtable = *reinterpret_cast<uintptr_t**>(msg);
     if (!vtable || !vtable[9]) return {};
-    using ByteSizeFn = int(__attribute__((cdecl)) *)(void*);
+    using ByteSizeFn = size_t(*)(void*);
+#if !defined(__x86_64__)
     ProtoCrashGuard guard;
     int sig = sigsetjmp(g_protoJmpBuf, 1);
     if (sig != 0) {
         LOG("[Hook] SerializeToArray helper crashed with signal %d", sig);
         return {};
     }
+#endif
 
-    int size = ((ByteSizeFn)vtable[9])(msg);
-    if (size <= 0 || size > 64 * 1024 * 1024) return {};
+    size_t size = reinterpret_cast<ByteSizeFn>(vtable[9])(msg);
+    if (size == 0 || size > 64 * 1024 * 1024) return {};
 
     std::vector<uint8_t> buf(size);
-    g_serializeToArray(msg, buf.data());
+    uintptr_t end = reinterpret_cast<uintptr_t>(g_serializeToArray(msg, buf.data()));
+    uintptr_t start = reinterpret_cast<uintptr_t>(buf.data());
+    if (end < start || end - start > size) {
+        LOG("[Hook] SerializeToArray returned invalid end pointer %p", reinterpret_cast<void*>(end));
+        return {};
+    }
+    buf.resize(end - start);
     return buf;
 }
 
 static bool ParseIntoMessage(void* msg, const uint8_t* data, size_t len) {
     if (!msg || !g_parseFromArray || !data || len == 0) return false;
     if (len > (size_t)INT_MAX) return false;
+#if !defined(__x86_64__)
     ProtoCrashGuard guard;
     int sig = sigsetjmp(g_protoJmpBuf, 1);
     if (sig != 0) {
         LOG("[Hook] ParseFromArray helper crashed with signal %d while parsing %zu bytes", sig, len);
         return false;
     }
+#endif
     return g_parseFromArray(msg, data, (int)len) != 0;
 }
 
@@ -251,21 +354,32 @@ static const uint8_t* SerializeBodyTL(void* bodyObj, size_t* outLen) {
     return tlBuf.empty() ? nullptr : tlBuf.data();
 }
 
-void CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize) {
+bool CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize) {
+#if defined(__x86_64__)
+    // Both optional observers below still describe i386 structures and emit
+    // i386 detours. Cloud RPCs use the independently resolved SysV helpers.
+    (void)steamclientBase;
+    (void)steamclientSize;
+    LOG("[GamesPlayed] x86-64 playtime observers disabled (legacy i386 ABI)");
+    return true;
+#else
     if (!g_serializeToArray) {
         LOG("[GamesPlayed] serializer not resolved -- playtime tracking disabled");
-        return;
+        return true;
     }
 
     // Always install -- runs before config sets the toggles; per-message paths
     // already check the live toggle (matches Windows).
     GamesPlayedHook::SetSerializer(&SerializeBodyTL);
-    GamesPlayedHook::Install(steamclientBase, steamclientSize);
+    if (!GamesPlayedHook::Install(steamclientBase, steamclientSize) && !GamesPlayedHook::Remove())
+        return false;
 
-    if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray))
-        LivePlaytime::InstallUserCapture();
+    if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray) &&
+        !LivePlaytime::InstallUserCapture() && !LivePlaytime::RemoveUserCapture())
+        return false;
+    return true;
 
-
+#endif
 }
 
 static std::optional<CloudIntercept::RpcResult> DispatchCloudRpc(
@@ -918,13 +1032,17 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
     return true;
 }
 
-void CloudHooks::BeginShutdown() {
+void CloudHooks::Enable() {
+    g_shuttingDown.store(false, std::memory_order_release);
+}
+
+bool CloudHooks::BeginShutdown(bool drainPendingPlaytime) {
     g_shuttingDown.store(true, std::memory_order_release);
-    GamesPlayedHook::Remove();
-    if (g_statsSyncEnabled.load(std::memory_order_relaxed)) {
+    bool removed = GamesPlayedHook::Remove();
+    if (drainPendingPlaytime && g_statsSyncEnabled.load(std::memory_order_relaxed)) {
         LivePlaytime::DrainOnNetThread();
     }
-    LivePlaytime::RemoveUserCapture();
+    removed = LivePlaytime::RemoveUserCapture() && removed;
     for (int i = 0; i < 300 && g_hookRefCount.load(std::memory_order_acquire) > 0; ++i)
         usleep(10000); // 10ms, up to 3s total
 
@@ -959,4 +1077,5 @@ void CloudHooks::BeginShutdown() {
             g_seedThread.detach();
         }
     }
+    return removed;
 }

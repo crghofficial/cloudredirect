@@ -1,5 +1,6 @@
 #include "live_playtime.h"
 #include "log.h"
+#include "memory_protection.h"
 
 #include <atomic>
 #include <cstring>
@@ -126,6 +127,7 @@ static uint8_t* g_writerStart = nullptr;
 static uint8_t* g_hookPoint = nullptr;
 static uint8_t  g_savedBytes[16];
 static size_t   g_savedLen = 0;
+static MemoryProtection g_protection;
 static uint8_t* g_trampoline = nullptr;
 
 // Recorded on the writer's natural entry. ebp+8 = a1 = CUser.
@@ -134,14 +136,6 @@ extern "C" void LivePlaytime_CaptureUser(int pUser) {
         g_pUser.store(pUser, std::memory_order_release);
         LOG("[Stats] Captured CUser=%p for live playtime updates", (void*)(uintptr_t)pUser);
     }
-}
-
-static bool MakeWritable(void* addr, size_t len) {
-    long ps = sysconf(_SC_PAGESIZE);
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(ps - 1);
-    uintptr_t endA = (uintptr_t)addr + len;
-    size_t pl = ((endA - page) + (ps - 1)) & ~(size_t)(ps - 1);
-    return mprotect((void*)page, pl, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
 // Trampoline: run stolen bytes, then read CUser from [ebp+8] and call the
@@ -340,8 +334,8 @@ bool InstallUserCapture() {
     }
     g_savedLen = WRITER_STOLEN;
     memcpy(g_savedBytes, g_hookPoint, g_savedLen);
-    if (!MakeWritable(g_hookPoint, g_savedLen)) {
-        g_captureInstalled.store(false);
+    if (!g_protection.Capture(g_hookPoint, g_savedLen) || !g_protection.MakeWritable()) {
+        RemoveUserCapture();
         return false;
     }
     int32_t rel = (int32_t)((uintptr_t)g_trampoline - ((uintptr_t)g_hookPoint + 5));
@@ -349,17 +343,25 @@ bool InstallUserCapture() {
     memcpy(g_hookPoint + 1, &rel, 4);
     for (size_t i = 5; i < g_savedLen; ++i) g_hookPoint[i] = 0x90; // nop pad
     __builtin___clear_cache((char*)g_hookPoint, (char*)g_hookPoint + g_savedLen);
+    if (!g_protection.Restore()) {
+        RemoveUserCapture();
+        return false;
+    }
     LOG("[Stats] LivePlaytime CUser-capture detour installed at %p", g_hookPoint);
     return true;
 }
 
-void RemoveUserCapture() {
-    if (!g_captureInstalled.load(std::memory_order_acquire)) return;
-    if (g_hookPoint && MakeWritable(g_hookPoint, g_savedLen)) {
+bool RemoveUserCapture() {
+    if (!g_captureInstalled.load(std::memory_order_acquire)) return true;
+    if (g_protection.count) {
+        if (!g_protection.MakeWritable()) return false;
         memcpy(g_hookPoint, g_savedBytes, g_savedLen);
         __builtin___clear_cache((char*)g_hookPoint, (char*)g_hookPoint + g_savedLen);
+        if (!g_protection.Restore()) return false;
     }
+    g_protection = {};
     g_captureInstalled.store(false, std::memory_order_release);
+    return true;
 }
 
 bool Ready() {

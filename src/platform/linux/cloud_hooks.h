@@ -5,10 +5,10 @@
 
 namespace CloudHooks
 {
-    // Called after hooks are installed to store the original function pointers
+    // Store originals before publishing hooks to Steam.
     void SetOriginals(void* origSlot5, void* origSlot7, void* origSlot8);
 
-    // Called after IsCloudEnabledForApp hook is installed
+    // Called by the vtable installer before publishing IsCloudEnabledForApp.
     void SetOriginalIsCloudEnabled(void* orig);
 
     // Resolve protobuf helper functions from the loaded steamclient.so.
@@ -16,9 +16,13 @@ namespace CloudHooks
     bool ResolveProtobufHelpers(void* steamclientBase, size_t steamclientSize);
 
     // Install the GamesPlayed observer (playtime tracking) using the resolved
-    // protobuf serializer. Call after ResolveProtobufHelpers succeeds.
-    void InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize);
+    // protobuf serializer. False means a failed patch could not be rolled back.
+    bool InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize);
 
-    // Signal hooks to stop and wait for in-flight calls to drain.
-    void BeginShutdown();
+    // Publish interception only after startup has completed.
+    void Enable();
+
+    // Stop interception and drain hooks. Init rollback must not apply queued
+    // playtime writes from the initialization thread.
+    bool BeginShutdown(bool drainPendingPlaytime = true);
 }

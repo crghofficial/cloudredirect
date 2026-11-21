@@ -173,7 +173,8 @@ if(WIN32)
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)
-    # Steam on Linux is 32-bit; use LINUX_32BIT=ON when cross-compiling on 64-bit host
+    # Current Steam clients are x86-64. LINUX_32BIT remains available for
+    # legacy clients; the compiler's target controls the default architecture.
     # Match Steam's pre-C++11 ABI
     target_compile_definitions(cloud_redirect PRIVATE _GLIBCXX_USE_CXX11_ABI=0 _FILE_OFFSET_BITS=64)
     target_compile_options(cloud_redirect PRIVATE -fvisibility=hidden)
@@ -223,12 +224,32 @@ else()
             target_link_libraries(cloud_redirect PRIVATE atomic)
         endif()
     endif()
+    if(NOT LINUX_32BIT)
+        # The old build only linked HTTP dependencies in its -m32 branch,
+        # leaving an apparently successful x64 DSO with unresolved curl calls.
+        # Use an isolated static dependency prefix for Steam Runtime builds.
+        set(CR_DEPS_PREFIX "" CACHE PATH "Static curl/OpenSSL dependency prefix")
+        if(CR_DEPS_PREFIX)
+            target_include_directories(cloud_redirect PRIVATE "${CR_DEPS_PREFIX}/include")
+            target_link_libraries(cloud_redirect PRIVATE
+                "${CR_DEPS_PREFIX}/lib/libcurl.a"
+                "${CR_DEPS_PREFIX}/lib/libssl.a"
+                "${CR_DEPS_PREFIX}/lib/libcrypto.a")
+            target_link_options(cloud_redirect PRIVATE -Wl,--exclude-libs,ALL)
+        else()
+            find_package(CURL REQUIRED)
+            target_link_libraries(cloud_redirect PRIVATE CURL::libcurl)
+        endif()
+    endif()
+    # A loadable injected library must not defer missing dependency errors to
+    # Steam's dynamic loader.
+    target_link_options(cloud_redirect PRIVATE -Wl,-z,defs)
     # Strip in release
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_link_options(cloud_redirect PRIVATE -s)
     endif()
 
-    # CLI wrapper (32-bit loader for cloud_redirect.so)
+    # CLI wrapper must have the same architecture as cloud_redirect.so.
     add_executable(cloud_redirect_cli
         src/platform/linux/cli_main.cpp
     )
@@ -484,6 +505,101 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
         target_sources(pending_ops_journal_tests PRIVATE src/platform/linux/log.cpp src/platform/linux/platform_linux.cpp)
     endif()
     add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT LINUX_32BIT)
+    find_package(Qt6 QUIET COMPONENTS Core)
+    if(TARGET Qt6::Core)
+        add_executable(native_binary_tests tests/native_binary_tests.cpp)
+        target_include_directories(native_binary_tests PRIVATE ui-linux/src)
+        target_link_libraries(native_binary_tests PRIVATE Qt6::Core)
+        add_test(NAME native_binary_tests COMMAND native_binary_tests)
+        add_executable(deployer_file_tests
+            tests/deployer_file_tests.cpp
+            ui-linux/src/deployer.cpp
+            ui-linux/src/steam_launcher.cpp)
+        set_target_properties(deployer_file_tests PROPERTIES AUTOMOC ON)
+        target_include_directories(deployer_file_tests PRIVATE ui-linux/src)
+        target_link_libraries(deployer_file_tests PRIVATE Qt6::Core)
+        add_test(NAME deployer_file_tests COMMAND deployer_file_tests)
+    endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT LINUX_32BIT)
+    add_executable(linux_kv64_resolver_tests tests/linux_kv64_resolver_tests.cpp)
+    target_include_directories(linux_kv64_resolver_tests PRIVATE src/platform/linux)
+    add_test(NAME linux_kv64_resolver_tests COMMAND linux_kv64_resolver_tests)
+
+    add_executable(linux_kv_tree_tests tests/linux_kv_tree_tests.cpp
+        src/platform/linux/vtable_hook.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_kv_tree_tests PRIVATE src/common src/platform/linux)
+    target_compile_definitions(linux_kv_tree_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_options(linux_kv_tree_tests PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(linux_kv_tree_tests PRIVATE -Wl,--gc-sections)
+    add_test(NAME linux_kv_tree_tests COMMAND linux_kv_tree_tests)
+
+    foreach(test IN ITEMS linux64_protobuf_abi_tests linux64_steam_protobuf_smoke)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/providers src/platform/linux)
+        target_compile_definitions(${test} PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+        target_compile_options(${test} PRIVATE -ffunction-sections -fdata-sections -UNDEBUG)
+        target_link_options(${test} PRIVATE -Wl,--gc-sections)
+        target_link_libraries(${test} PRIVATE dl pthread)
+    endforeach()
+    add_test(NAME linux64_protobuf_abi_tests COMMAND linux64_protobuf_abi_tests)
+
+    add_executable(linux_vtable_probe tests/linux_vtable_probe.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_vtable_probe PRIVATE src/common src/providers src/platform/linux)
+    target_compile_definitions(linux_vtable_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=0 CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+    target_link_libraries(linux_vtable_probe PRIVATE dl pthread)
+    add_test(NAME linux_vtable_probe COMMAND linux_vtable_probe)
+
+    add_executable(linux_preload_lifecycle_tests tests/linux_preload_lifecycle_tests.cpp)
+    set_target_properties(linux_preload_lifecycle_tests PROPERTIES OUTPUT_NAME steam
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/preload-fixture")
+    target_link_libraries(linux_preload_lifecycle_tests PRIVATE dl)
+    add_dependencies(linux_preload_lifecycle_tests cloud_redirect)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/preload-fixture/config/CloudRedirect")
+    add_test(NAME linux_preload_lifecycle_tests COMMAND ${CMAKE_COMMAND} -E env
+        "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/preload-fixture/config"
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cloud_redirect>"
+        "LD_PRELOAD=$<TARGET_FILE_NAME:cloud_redirect>"
+        $<TARGET_FILE:linux_preload_lifecycle_tests> $<TARGET_FILE_NAME:cloud_redirect>)
+    set_tests_properties(linux_preload_lifecycle_tests PROPERTIES TIMEOUT 4)
+endif()
+
+# Hook lifecycle and AutoCloud library selection run in both client architectures.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (NOT LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
+    foreach(test IN ITEMS linux_hook_lifecycle_tests linux_init_failure_tests)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/platform/linux)
+        target_compile_definitions(${test} PRIVATE CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+        target_link_libraries(${test} PRIVATE dl pthread)
+    endforeach()
+    foreach(test IN ITEMS linux_hook_dispatch_tests linux_inline_hook_tests)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/platform/linux)
+        target_compile_options(${test} PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(${test} PRIVATE -Wl,--gc-sections)
+        target_link_libraries(${test} PRIVATE pthread dl)
+        add_test(NAME ${test} COMMAND ${test})
+    endforeach()
+    target_sources(linux_hook_lifecycle_tests PRIVATE src/platform/linux/log.cpp)
+    target_link_options(linux_hook_lifecycle_tests PRIVATE -Wl,--wrap=mprotect)
+    foreach(scenario IN ITEMS success failed-install failed-seal failed-remove failed-remove-seal other-hook)
+        add_test(NAME linux_hook_${scenario} COMMAND linux_hook_lifecycle_tests ${scenario})
+    endforeach()
+    foreach(stage RANGE 0 8)
+        add_test(NAME linux_init_failure_${stage} COMMAND linux_init_failure_tests ${stage})
+    endforeach()
+    add_executable(linux_external_library_tests tests/linux_external_library_tests.cpp
+        src/common/autocloud_scan.cpp src/common/vdf.cpp
+        src/platform/linux/platform_linux.cpp src/platform/linux/log.cpp)
+    target_include_directories(linux_external_library_tests PRIVATE src/common src/platform/linux)
+    target_compile_options(linux_external_library_tests PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(linux_external_library_tests PRIVATE -Wl,--gc-sections)
+    add_test(NAME linux_external_library_tests COMMAND linux_external_library_tests)
 endif()
 
 # ── UI (Windows only) ───────────────────────────────────────────────────

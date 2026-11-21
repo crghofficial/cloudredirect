@@ -21,6 +21,7 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <ucontext.h>
@@ -31,14 +32,16 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include <string>
 #include <cstdint>
 #include <pthread.h>
+#include <exception>
 
 static VtableHook::VtableInfo g_vtableInfo{};
 static VtableHook::CloudEnabledHookInfo g_cloudEnabledInfo{};
 static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_hookAttempted{false};
 static std::atomic<bool> g_logInitialized{false};
 static pthread_t g_initThread{};
-static std::atomic<bool> g_initThreadDone{false};
+static bool g_initThreadStarted = false;
+static bool g_hookCleanupPending = false;
+static std::atomic<bool> g_stopInit{false};
 
 // Raw diagnostic logging (survives even if C++ runtime is broken)
 
@@ -141,6 +144,10 @@ static void CleanLdPreload()
     char* preload = getenv("LD_PRELOAD");
     if (!preload) return;
 
+    Dl_info library{};
+    struct stat loaded{};
+    const bool haveIdentity = dladdr(reinterpret_cast<const void*>(&CleanLdPreload), &library) &&
+        library.dli_fname && stat(library.dli_fname, &loaded) == 0;
     std::string val(preload);
     std::string cleaned;
     size_t pos = 0;
@@ -149,7 +156,11 @@ static void CleanLdPreload()
         size_t sep = val.find_first_of(": ", pos);
         if (sep == std::string::npos) sep = val.size();
         std::string entry = val.substr(pos, sep - pos);
-        if (!entry.empty() && entry.find("cloud_redirect") == std::string::npos)
+        struct stat candidate{};
+        const bool isCloudRedirect = entry == "cloud_redirect.so" ||
+            (haveIdentity && !entry.empty() && stat(entry.c_str(), &candidate) == 0 &&
+             candidate.st_dev == loaded.st_dev && candidate.st_ino == loaded.st_ino);
+        if (!entry.empty() && !isCloudRedirect)
         {
             if (!cleaned.empty()) cleaned += ':';
             cleaned += entry;
@@ -160,6 +171,20 @@ static void CleanLdPreload()
         unsetenv("LD_PRELOAD");
     else
         setenv("LD_PRELOAD", cleaned.c_str(), 1);
+}
+
+static bool RemoveInstalledHooks(bool drainPendingPlaytime)
+{
+    bool removed = CloudHooks::BeginShutdown(drainPendingPlaytime);
+    if (g_hookCleanupPending) {
+        CloudStorage::Shutdown();
+        HttpServer::Stop();
+    }
+    removed = VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo) && removed;
+    removed = VtableHook::RemoveHooks(g_vtableInfo) && removed;
+    g_initialized.store(false, std::memory_order_release);
+    g_hookCleanupPending = !removed;
+    return removed;
 }
 
 static void DoInit()
@@ -189,6 +214,11 @@ static void DoInit()
     }
     Log::Info("steamclient.so base=%p size=0x%zx", (void*)steamBase, steamSize);
 
+    // The steamrt64 bootstrap execs Steam again inside pressure-vessel. Do not
+    // strip the preload in that launcher; only the process that loads the real
+    // steamclient may stop passing it to children.
+    CleanLdPreload();
+
     DebugLog("[CR] DoInit: finding transport vtable\n");
     void** vtable = VtableHook::FindTransportVtable(steamBase, steamSize);
     if (!vtable)
@@ -201,10 +231,29 @@ static void DoInit()
     Log::Info("Transport vtable at %p, slots: [5]=%p [7]=%p [8]=%p",
               (void*)vtable, vtable[5], vtable[7], vtable[8]);
 
+    // Resolve every mandatory ABI-dependent operation before modifying Steam.
+    // A partial port must not report success or intercept RPCs it cannot decode.
+    bool pbOk = CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
+#if defined(__x86_64__)
+    if (!pbOk || !SteamKvInjector::Init()) {
+        Log::Error("Init failed: required protobuf/KV ABI could not be resolved; no hooks installed");
+        Notify("Incompatible Steam client - hooks disabled", true);
+        return;
+    }
+
+#else
+    if (!pbOk)
+        Log::Error("Protobuf helpers not fully resolved -- cloud RPCs may fail");
+#endif
+
+    if (g_stopInit.load(std::memory_order_acquire))
+        return;
+
     DebugLog("[CR] DoInit: saving originals\n");
     CloudHooks::SetOriginals(vtable[5], vtable[7], vtable[8]);
 
     DebugLog("[CR] DoInit: installing transport hooks\n");
+    g_hookCleanupPending = true;
     if (!VtableHook::InstallHooks(vtable, g_vtableInfo))
     {
         DebugLog("[CR] DoInit: FAILED - hook installation failed\n");
@@ -219,26 +268,25 @@ static void DoInit()
     {
         if (VtableHook::InstallCloudEnabledHook(rsVtable, g_cloudEnabledInfo))
         {
-            CloudHooks::SetOriginalIsCloudEnabled(g_cloudEnabledInfo.origSlot);
             Log::Info("IsCloudEnabledForApp hook installed");
         }
-        else
+        else {
             Log::Warn("IsCloudEnabledForApp hook install failed (cloud toggle may not work)");
+            if (g_cloudEnabledInfo.vtable) return;
+        }
     }
     else
         Log::Warn("CUserRemoteStorage vtable not found (cloud toggle may not work)");
-
-    DebugLog("[CR] DoInit: resolving protobuf helpers\n");
-    bool pbOk = CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
-    if (!pbOk)
-        Log::Error("Protobuf helpers not fully resolved -- cloud RPCs may fail");
 
     // Observe outbound CMsgClientGamesPlayed to track namespace-app playtime.
     // Skipped entirely when stats_sync_enabled=false in config.json -- avoids
     // patching steamclient.so when the user doesn't want stats/achievements.
     if (pbOk && StatsSyncEnabled())
     {
-        CloudHooks::InstallGamesPlayedObserver(steamBase, steamSize);
+        if (!CloudHooks::InstallGamesPlayedObserver(steamBase, steamSize)) {
+            Log::Error("Optional observer rollback failed; aborting initialization");
+            return;
+        }
     }
     else if (pbOk)
     {
@@ -252,19 +300,23 @@ static void DoInit()
             LegacyMetadataCleanup::PruneSteamUserdata(steamPath);
     }
 
-    DebugLog("[CR] DoInit: initializing KV injector\n");
+#if !defined(__x86_64__)
     SteamKvInjector::Init();
+#endif
 
+    if (g_stopInit.load(std::memory_order_acquire))
+        return;
+    CloudHooks::Enable();
     g_initialized.store(true, std::memory_order_release);
     DebugLog("[CR] DoInit: SUCCESS\n");
-    Log::Info("CloudRedirect initialized successfully (all hooks active)");
+    Log::Info("CloudRedirect initialized successfully (cloud save hooks active; optional observers reported above)");
     Notify("Loaded successfully");
 }
 
 
 
-static sigjmp_buf g_crashJmpBuf;
-static volatile sig_atomic_t g_inScan = 0;
+static thread_local sigjmp_buf g_crashJmpBuf;
+static thread_local volatile sig_atomic_t g_inScan = 0;
 
 static void ScanCrashHandler(int sig)
 {
@@ -539,10 +591,17 @@ static void* DeferredInitThread(void*)
     // Poll for steamclient.so -- under LD_PRELOAD we load before Steam has
     // mapped steamclient, so a fixed delay is insufficient.
     DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
-    for (int i = 0; i < 20; i++) {  // up to 10 seconds
-        if (SteamclientMapped()) break;
-        usleep(500000);
+    for (int i = 0; !SteamclientMapped(); ++i) {
+        if (g_stopInit.load(std::memory_order_acquire))
+            return nullptr;
+        if (i == 100) {
+            DebugLog("[CR] DeferredInit: launcher process has no steamclient; leaving preload for runtime child\n");
+            return nullptr;
+        }
+        usleep(100000);
     }
+    if (g_stopInit.load(std::memory_order_acquire))
+        return nullptr;
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -553,15 +612,26 @@ static void* DeferredInitThread(void*)
     sigaction(SIGSEGV, &sa, &old_segv);
     sigaction(SIGBUS, &sa, &old_bus);
 
-    g_inScan = 1;
-    if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
-        DoInit();
-    } else {
-        DebugLog("[CR] DeferredInit: CRASHED during init, aborting safely\n");
-        Log::Error("Caught signal during init - incompatible steamclient? Hooks NOT installed.");
-        Notify("Crashed during init - hooks disabled", true);
+    bool failed = false;
+    try {
+        if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+            g_inScan = 1;
+            DoInit();
+        } else {
+            DebugLog("[CR] DeferredInit: signal during init\n");
+            Log::Error("Caught signal during initialization");
+            failed = true;
+        }
+    } catch (const std::exception& error) {
+        Log::Error("Initialization failed: %s", error.what());
+        failed = true;
+    } catch (...) {
+        Log::Error("Initialization failed with an unknown exception");
+        failed = true;
     }
     g_inScan = 0;
+    if (failed)
+        g_initialized.store(false, std::memory_order_release);
 
     // Restore original handlers and install crash dump handler if init succeeded
     sigaction(SIGSEGV, &old_segv, nullptr);
@@ -569,9 +639,16 @@ static void* DeferredInitThread(void*)
 
     if (g_initialized.load(std::memory_order_acquire)) {
         InstallCrashDumpHandler();
+    } else {
+        if (RemoveInstalledHooks(false)) {
+            Log::Warn("Initialization incomplete; hooks removed and page permissions restored");
+            if (failed) Notify("Initialization failed - hooks removed", true);
+        } else {
+            Log::Error("Initialization incomplete; hook rollback failed, interception disabled");
+            Notify("Initialization failed - rollback incomplete, restart Steam", true);
+        }
     }
 
-    g_initThreadDone.store(true, std::memory_order_release);
     return nullptr;
 }
 
@@ -584,54 +661,38 @@ static void OnLoad()
     if (proc != "steam" && !SteamclientMapped())
         return;
 
-    // Clean ourselves from LD_PRELOAD so child processes don't inherit us
-    CleanLdPreload();
-
     EnsureLogInit();
     DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");
     Log::Info("cloud_redirect.so active in process 'steam' (pid=%d)", getpid());
 
-    bool expected = false;
-    if (g_hookAttempted.compare_exchange_strong(expected, true))
-    {
-        if (pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) != 0) {
-            DebugLog("[CR] OnLoad: FAILED to create init thread\n");
-            g_initThreadDone.store(true, std::memory_order_release);
-        }
-    }
+    g_initThreadStarted = pthread_create(&g_initThread, nullptr, DeferredInitThread, nullptr) == 0;
+    if (!g_initThreadStarted)
+        DebugLog("[CR] OnLoad: FAILED to create init thread\n");
 }
 
 __attribute__((destructor))
 static void OnUnload()
 {
-    DebugLog("[CR] OnUnload: shutting down\n");
-
-    // Wait for the init thread to finish so we don't unmap code it's executing.
-    // The thread runs for ~2s (usleep) + init time, so this is bounded.
-    if (g_hookAttempted.load(std::memory_order_acquire)) {
-        if (!g_initThreadDone.load(std::memory_order_acquire)) {
-            DebugLog("[CR] OnUnload: waiting for init thread\n");
-            pthread_join(g_initThread, nullptr);
-        }
+    // A launcher can exit without mapping steamclient. Cancel its poll before
+    // joining, so exit does not wait for the full bootstrap timeout.
+    if (g_initThreadStarted) {
+        g_stopInit.store(true, std::memory_order_release);
+        pthread_join(g_initThread, nullptr);
+        g_initThreadStarted = false;
     }
 
-    // No-op (sync-icon state writer was never wired up); kept for contract.
-    CloudIntercept::FlushPendingSyncStates();
-
-    // Shut down cloud storage (signals workers, drains queue with timeout)
-    CloudStorage::Shutdown();
-
-    // Stop the HTTP server (joins accept + client threads)
-    HttpServer::Stop();
-
-    if (g_initialized.load(std::memory_order_acquire))
+    const bool initialized = g_initialized.load(std::memory_order_acquire);
+    if (initialized || g_hookCleanupPending)
     {
-        CloudHooks::BeginShutdown();
-        VtableHook::RemoveHooks(g_vtableInfo);
-        VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo);
-        Log::Info("cloud_redirect.so unloaded");
+        if (initialized) CloudIntercept::FlushPendingSyncStates();
+        if (RemoveInstalledHooks(initialized))
+            Log::Info("cloud_redirect.so unloaded");
+        else
+            Log::Error("Hook cleanup incomplete during unload");
     }
-    if (g_debugFd >= 0)
+    if (g_debugFd >= 0) {
         close(g_debugFd);
+        g_debugFd = -1;
+    }
 }
 

@@ -3,6 +3,7 @@
 #include "metadata_sync.h"
 #include "live_playtime.h"
 #include "log.h"
+#include "memory_protection.h"
 
 #include <atomic>
 #include <cstring>
@@ -10,6 +11,18 @@
 #include <unistd.h>
 
 namespace GamesPlayedHook {
+
+#if defined(__x86_64__)
+// The legacy observer below emits i386 pushad/PIC trampolines and reads the
+// 32-bit CProtoBufMsg layout. Never apply those bytes to a 64-bit client. Cloud
+// save RPC hooks do not depend on this optional playtime/achievement observer.
+void SetSerializer(SerializeBodyFn) {}
+bool Install(uintptr_t, size_t) {
+    LOG("[GamesPlayed] x86-64 send observer is not implemented; inline patch skipped");
+    return false;
+}
+bool Remove() { return true; }
+#else
 
 // CProtoBufMsg 32-bit layout (reversed from ctor): EMsg at +20 (high bit is the
 // send flag, mask it off), body protobuf object pointer at +32.
@@ -39,6 +52,7 @@ static uint8_t* g_funcStart = nullptr;     // resolved CCMInterface::Send entry
 static uint8_t* g_hookPoint = nullptr;     // funcStart + PROLOGUE_LEN
 static uint8_t  g_savedBytes[16];          // original bytes at the hook point
 static size_t   g_savedLen = 0;
+static MemoryProtection g_protection;
 static uint8_t* g_trampoline = nullptr;    // executable: stolen bytes + jmp back
 
 // The PIC prologue (push ebp/edi/esi/ebx; call get_pc_thunk; add ebx, delta) is
@@ -219,14 +233,6 @@ static bool FindBySignature(uintptr_t base, size_t size, uint8_t*& outFuncStart)
     return false;
 }
 
-static bool MakeWritable(void* addr, size_t len) {
-    long pageSize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(pageSize - 1);
-    uintptr_t endAddr = (uintptr_t)addr + len;
-    size_t pageLen = ((endAddr - page) + (pageSize - 1)) & ~(size_t)(pageSize - 1);
-    return mprotect((void*)page, pageLen, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
-}
-
 bool Install(uintptr_t steamclientBase, size_t steamclientSize) {
     bool expected = false;
     if (!g_installed.compare_exchange_strong(expected, true)) return true;
@@ -251,9 +257,9 @@ bool Install(uintptr_t steamclientBase, size_t steamclientSize) {
     g_savedLen = STOLEN_LEN;
     memcpy(g_savedBytes, g_hookPoint, g_savedLen);
 
-    if (!MakeWritable(g_hookPoint, g_savedLen)) {
+    if (!g_protection.Capture(g_hookPoint, g_savedLen) || !g_protection.MakeWritable()) {
         LOG("[GamesPlayed] mprotect RWX failed at hook point");
-        g_installed.store(false);
+        Remove();
         return false;
     }
 
@@ -264,22 +270,32 @@ bool Install(uintptr_t steamclientBase, size_t steamclientSize) {
     for (size_t i = 5; i < g_savedLen; ++i) g_hookPoint[i] = 0x90; // nop
 
     __builtin___clear_cache((char*)g_hookPoint, (char*)g_hookPoint + g_savedLen);
+    if (!g_protection.Restore()) {
+        Remove();
+        return false;
+    }
     LOG("[GamesPlayed] Inline detour installed at %p -> trampoline %p", g_hookPoint, g_trampoline);
     return true;
 }
 
-void Remove() {
-    if (!g_installed.load(std::memory_order_acquire)) return;
+bool Remove() {
+    if (!g_installed.load(std::memory_order_acquire)) return true;
     g_shuttingDown.store(true, std::memory_order_release);
 
-    if (g_hookPoint && MakeWritable(g_hookPoint, g_savedLen)) {
+    if (g_protection.count) {
+        if (!g_protection.MakeWritable()) return false;
         memcpy(g_hookPoint, g_savedBytes, g_savedLen);
         __builtin___clear_cache((char*)g_hookPoint, (char*)g_hookPoint + g_savedLen);
+        if (!g_protection.Restore()) return false;
     }
     for (int i = 0; i < 300 && g_inFlight.load(std::memory_order_acquire) > 0; ++i)
         usleep(10000); // up to 3s
 
+    g_protection = {};
     g_installed.store(false, std::memory_order_release);
+    return true;
 }
+
+#endif
 
 } // namespace GamesPlayedHook

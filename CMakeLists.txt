@@ -514,10 +514,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT LI
         target_include_directories(native_binary_tests PRIVATE ui-linux/src)
         target_link_libraries(native_binary_tests PRIVATE Qt6::Core)
         add_test(NAME native_binary_tests COMMAND native_binary_tests)
-        add_executable(deployer_file_tests tests/deployer_file_tests.cpp)
+        add_executable(deployer_file_tests tests/deployer_file_tests.cpp ui-linux/src/deployer.cpp)
+        set_target_properties(deployer_file_tests PROPERTIES AUTOMOC ON)
+        target_include_directories(deployer_file_tests PRIVATE ui-linux/src)
         target_link_libraries(deployer_file_tests PRIVATE Qt6::Core)
-        target_compile_options(deployer_file_tests PRIVATE -ffunction-sections -fdata-sections)
-        target_link_options(deployer_file_tests PRIVATE -Wl,--gc-sections)
         add_test(NAME deployer_file_tests COMMAND deployer_file_tests)
     endif()
 endif()
@@ -564,7 +564,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
         "LD_PRELOAD=$<TARGET_FILE_NAME:cloud_redirect>"
         $<TARGET_FILE:linux_preload_lifecycle_tests> $<TARGET_FILE_NAME:cloud_redirect>)
     set_tests_properties(linux_preload_lifecycle_tests PROPERTIES TIMEOUT 4)
+endif()
 
+# AutoCloud library selection also runs in the legacy client.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (NOT LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
     add_executable(linux_external_library_tests tests/linux_external_library_tests.cpp
         src/common/autocloud_scan.cpp src/common/vdf.cpp
         src/platform/linux/platform_linux.cpp src/platform/linux/log.cpp)

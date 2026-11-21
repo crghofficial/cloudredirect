@@ -82,6 +82,15 @@ jobs:
         run: |
           scripts/build-linux64.sh
           scripts/stage-flatpak.sh
+      - name: Reject binaries that need a newer dynamic loader
+        run: |
+          echo 'void CloudRedirect_CliMain(void) {}' > "$RUNNER_TEMP/relr.c"
+          cc -shared -fPIC -Wl,-z,pack-relative-relocs "$RUNNER_TEMP/relr.c" -o "$RUNNER_TEMP/relr.so"
+          readelf -d "$RUNNER_TEMP/relr.so" | grep '(RELR)'
+          if python3 scripts/check-linux64-abi.py "$RUNNER_TEMP/relr.so" > "$RUNNER_TEMP/abi-check.log" 2>&1; then
+            exit 1
+          fi
+          grep -F "uses DT_RELR" "$RUNNER_TEMP/abi-check.log"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: cloudredirect-linux-x86_64

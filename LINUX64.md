@@ -6,7 +6,7 @@ For Steam's `steamrt64` client, the library and CLI must both target x86-64. The
 
 Run `scripts/build-linux64.sh` from the repository root. The script downloads checksum-pinned dependencies into `build-deps/` and builds against a glibc 2.31 sysroot. Required host tools are clang, CMake, Ninja, make, ar, tar, Perl and Python 3. Output files are `build-steamrt64/cloud_redirect.so` and `build-steamrt64/cloud_redirect_cli`.
 
-The script links curl, OpenSSL and libstdc++ privately. `scripts/check-linux64-abi.py` checks the resulting ELF architecture, symbol-version requirements and CLI export before deployment. The tested library requires GLIBC 2.30.
+The script links curl, OpenSSL and libstdc++ privately. `scripts/check-linux64-abi.py` checks the resulting ELF architecture, symbol-version requirements, loader support for relocation formats and CLI export before deployment. The tested library requires GLIBC 2.30.
 
 ## Flatpak packaging
 
@@ -26,7 +26,7 @@ Legacy i386 GamesPlayed/LivePlaytime inline observers are skipped on x86-64. Aut
 
 ## Verification
 
-The isolated build runs CTest for the pending-operation journal, resolver rejection cases, corrupt tree pointers, concurrent protobuf calls, launcher exit and external Proton library paths. Native builds with Qt Core also test architecture validation and file replacement failures.
+The isolated build runs CTest for the pending-operation journal, resolver rejection cases, corrupt tree pointers, concurrent protobuf calls, launcher exit and external Proton library paths. Native builds with Qt Core also test architecture validation, failed file replacements and repair of an incomplete CLI installation via the deployer.
 
 The Linux workflow builds x86-64 and i386 libraries and runs their tests on each pull request. It also builds the Qt UI and produces Steam-compatible native artifacts. These jobs do not require a Steam account or cloud credentials.
 
@@ -39,5 +39,7 @@ LD_LIBRARY_PATH=/path/to/steamrt64 build-steamrt64/linux64_steam_protobuf_smoke 
 ```
 
 These probes passed against Steam builds 1792618285 and 1794536281. The protobuf test creates and round-trips an actual cloud request in a separate process. It selects its test vtable address only after matching the ELF SHA-256 and also checks that vtable's RTTI before calling it. Production resolution uses the same signatures for both builds.
+
+On Arch Linux, a Gamescope 3.17 session with and without Steam integration started an isolated Steam Runtime 4 container and ran the matching CLI. The compositor exited abnormally after the child finished, including in control runs without the preload. This does not establish the cause of the SteamOS report.
 
 Earlier live validation on 1792618285 with SLSsteam confirmed five downloads and an upload. Live sync on 1794536281, SteamOS Gaming Mode and a legacy i386 Steam session still need testing. The Flatpak preview was installed and launched in isolation. Future clients may need ABI verification when Valve changes internal layouts.

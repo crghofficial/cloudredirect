@@ -40,6 +40,8 @@ signals:
     void deployCompleted(bool success);
 
 private:
+    bool installBundledFiles();
+
     bool m_slssteamInstalled = false;
     bool m_headcrabInstalled = false;
     bool m_alreadyDeployed = false;

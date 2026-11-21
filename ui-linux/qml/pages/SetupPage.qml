@@ -181,6 +181,7 @@ Page {
                     }
                     Label {
                         visible: deployer && deployer.updateAvailable && deployer.deployedVersion && deployer.bundledVersion
+                                 && deployer.deployedVersion !== deployer.bundledVersion
                         text: deployer ? (deployer.deployedVersion + " → " + deployer.bundledVersion) : ""
                         font.family: "monospace"
                         opacity: 0.6

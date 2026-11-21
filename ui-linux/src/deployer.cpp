@@ -37,11 +37,9 @@ static QString getSoVersion(const QString &path)
     f.close();
 
     const char* p = data.constData();
-    if (data.size() < 20)
-        return QString();
-    const char* end = p + data.size() - 20;
+    const char* end = p + data.size();
     
-    for (; p < end; ++p) {
+    for (; end - p >= 13; ++p) {
         if (p[0] >= '0' && p[0] <= '9' &&
             p[1] == '.' &&
             p[2] >= '0' && p[2] <= '9' &&
@@ -51,13 +49,13 @@ static QString getSoVersion(const QString &path)
             const char* start = p;
             const char* q = p + 6;
             int hexCount = 0;
-            while (q < data.constData() + data.size() && 
+            while (q < end &&
                    ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f'))) {
                 ++hexCount;
                 ++q;
             }
             if (hexCount == 7) {
-                if (q + 6 <= data.constData() + data.size() && 
+                if (end - q >= 6 &&
                     strncmp(q, "-dirty", 6) == 0) {
                     q += 6;
                 }
@@ -184,8 +182,10 @@ void Deployer::checkPrerequisites()
     m_bundledVersion = getSoVersion(m_soSourcePath);
     m_deployedVersion = getSoVersion(m_soDeployPath);
     
+    const bool cliNeedsRepair = m_alreadyDeployed &&
+        (!NativeBinary::compatible(m_cliDeployPath, m_soDeployPath) || !QFileInfo(m_cliDeployPath).isExecutable());
     if (m_alreadyDeployed && !m_soSourcePath.isEmpty()) {
-        if (!QFile::exists(m_soDeployPath)) {
+        if (cliNeedsRepair) {
             m_updateAvailable = true;
         } else if (m_bundledVersion.isEmpty() || m_deployedVersion.isEmpty()) {
             QFile srcFile(m_soSourcePath);
@@ -207,6 +207,8 @@ void Deployer::checkPrerequisites()
         m_statusMessage = "h3adcr-b not installed. Did you run h3adcr-b first?";
     } else if (QFile::exists(m_soDeployPath) && !m_alreadyDeployed) {
         m_statusMessage = "The deployed library does not match the installed SLSsteam architecture.";
+    } else if (cliNeedsRepair) {
+        m_statusMessage = "The installed CLI is missing or incompatible. Reinstall the matching CLI from the bundle.";
     } else if (m_updateAvailable) {
         m_statusMessage = "Update available. A newer version is bundled with this app.";
     } else if (m_alreadyDeployed) {
@@ -219,6 +221,31 @@ void Deployer::checkPrerequisites()
 
     emit checkCompleted();
     emit statusMessageChanged();
+}
+
+bool Deployer::installBundledFiles()
+{
+    if (m_soSourcePath.isEmpty()) {
+        m_statusMessage = "Cannot install: cloud_redirect.so not found. Installation may be corrupted.";
+        return false;
+    }
+
+    if (!NativeBinary::compatible(m_soSourcePath, xdgDataHome() + "/SLSsteam/SLSsteam.so") ||
+        !NativeBinary::compatible(m_cliSourcePath, m_soSourcePath)) {
+        m_statusMessage = "Cannot install: the bundled library and CLI must match the installed SLSsteam architecture.";
+        return false;
+    }
+
+    if (!QDir().mkpath(crDataDir()) || !copyNativeBinary(m_cliSourcePath, m_cliDeployPath) ||
+        !copyNativeBinary(m_soSourcePath, m_soDeployPath)) {
+        m_statusMessage = "Failed to install the native files. Retry after checking directory permissions.";
+        return false;
+    }
+
+    m_alreadyDeployed = true;
+    m_updateAvailable = false;
+    m_deployedVersion = m_bundledVersion;
+    return true;
 }
 
 bool Deployer::deploy()
@@ -237,25 +264,7 @@ bool Deployer::deploy()
         return false;
     }
 
-    if (m_soSourcePath.isEmpty()) {
-        m_statusMessage = "Cannot deploy: cloud_redirect.so not found. Installation may be corrupted.";
-        emit statusMessageChanged();
-        emit deployCompleted(false);
-        return false;
-    }
-
-    if (!NativeBinary::compatible(m_soSourcePath, xdgDataHome() + "/SLSsteam/SLSsteam.so") ||
-        !NativeBinary::compatible(m_cliSourcePath, m_soSourcePath)) {
-        m_statusMessage = "Cannot deploy: the bundled library and CLI must match the installed SLSsteam architecture.";
-        emit statusMessageChanged();
-        emit deployCompleted(false);
-        return false;
-    }
-
-    QString crDir = crDataDir();
-    if (!QDir().mkpath(crDir) || !copyNativeBinary(m_cliSourcePath, m_cliDeployPath) ||
-        !copyNativeBinary(m_soSourcePath, m_soDeployPath)) {
-        m_statusMessage = "Failed to install the native files. Retry after checking directory permissions.";
+    if (!installBundledFiles()) {
         emit statusMessageChanged();
         emit deployCompleted(false);
         return false;
@@ -264,8 +273,7 @@ bool Deployer::deploy()
     QString configDir = crConfigDir();
     QDir().mkpath(configDir);
 
-    m_alreadyDeployed = true;
-    m_statusMessage = "CloudRedirect deployed to " + crDir + ". Restart Steam to activate.";
+    m_statusMessage = "CloudRedirect deployed to " + crDataDir() + ". Restart Steam to activate.";
     emit statusMessageChanged();
     emit checkCompleted();
     emit deployCompleted(true);
@@ -274,28 +282,11 @@ bool Deployer::deploy()
 
 bool Deployer::update()
 {
-    if (m_soSourcePath.isEmpty()) {
-        m_statusMessage = "No bundled .so found to update from.";
+    if (!installBundledFiles()) {
         emit statusMessageChanged();
         return false;
     }
 
-    if (!NativeBinary::compatible(m_soSourcePath, xdgDataHome() + "/SLSsteam/SLSsteam.so") ||
-        !NativeBinary::compatible(m_cliSourcePath, m_soSourcePath)) {
-        m_statusMessage = "Cannot update: the bundled library and CLI must match the installed SLSsteam architecture.";
-        emit statusMessageChanged();
-        return false;
-    }
-
-    QString crDir = crDataDir();
-    if (!QDir().mkpath(crDir) || !copyNativeBinary(m_cliSourcePath, m_cliDeployPath) ||
-        !copyNativeBinary(m_soSourcePath, m_soDeployPath)) {
-        m_statusMessage = "Failed to update the native files. Retry after checking directory permissions.";
-        emit statusMessageChanged();
-        return false;
-    }
-
-    m_updateAvailable = false;
     m_statusMessage = "Updated successfully. Restart Steam to use the new version.";
     emit statusMessageChanged();
     emit checkCompleted();
@@ -310,6 +301,8 @@ bool Deployer::undeploy()
         QFile::remove(m_cliDeployPath);
 
     m_alreadyDeployed = false;
+    m_updateAvailable = false;
+    m_deployedVersion.clear();
     m_statusMessage = "CloudRedirect removed. Restart Steam to deactivate.";
     emit statusMessageChanged();
     emit checkCompleted();

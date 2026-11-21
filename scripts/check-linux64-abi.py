@@ -2,6 +2,7 @@
 """Check the ELF headers, imported symbol versions and injected CLI entry point."""
 
 import argparse
+import os
 from pathlib import Path
 import re
 import struct
@@ -17,7 +18,13 @@ def check_elf(path):
 
 
 def check_versions(path):
-    versions = subprocess.check_output(["readelf", "-V", str(path)], text=True)
+    versions = subprocess.check_output(
+        ["readelf", "--wide", "--dynamic", "--version-info", str(path)],
+        text=True, env={**os.environ, "LC_ALL": "C"})
+    # Packed relative relocations need loader support even if all numbered
+    # GLIBC symbol versions are below our baseline.
+    if "(RELR)" in versions:
+        raise ValueError(f"{path} uses DT_RELR, unsupported by glibc 2.31")
     for prefix, limit in {"GLIBC": (2, 31), "GLIBCXX": (3, 4, 28), "CXXABI": (1, 3, 12)}.items():
         found = [tuple(map(int, version.split("."))) for version in
                  re.findall(r"Name: " + prefix + r"_([0-9.]+)", versions)]

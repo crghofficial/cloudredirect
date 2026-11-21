@@ -86,4 +86,4 @@ cmake -S . -B build-steamrt64 -G Ninja \
     -DCR_DEPS_PREFIX="$cr_deps/static"
 cmake --build build-steamrt64 -j"$cr_jobs"
 ctest --test-dir build-steamrt64 --output-on-failure
-python3 scripts/check-linux64-abi.py build-steamrt64/cloud_redirect.so
+python3 scripts/check-linux64-abi.py build-steamrt64/cloud_redirect.so --cli build-steamrt64/cloud_redirect_cli

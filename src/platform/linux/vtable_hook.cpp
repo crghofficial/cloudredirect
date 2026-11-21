@@ -1,5 +1,6 @@
 #include "vtable_hook.h"
 #include "log.h"
+#include "cloud_hooks.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -391,24 +392,6 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     return vtableFuncs;
 }
 
-static bool MakeWritable(void* addr, size_t len)
-{
-    long pageSize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pageSize - 1);
-    uintptr_t endAddr = reinterpret_cast<uintptr_t>(addr) + len;
-    size_t pageLen = ((endAddr - page) + (pageSize - 1)) & ~(pageSize - 1);
-    return mprotect(reinterpret_cast<void*>(page), pageLen, PROT_READ | PROT_WRITE) == 0;
-}
-
-static bool MakeReadOnly(void* addr, size_t len)
-{
-    long pageSize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pageSize - 1);
-    uintptr_t endAddr = reinterpret_cast<uintptr_t>(addr) + len;
-    size_t pageLen = ((endAddr - page) + (pageSize - 1)) & ~(pageSize - 1);
-    return mprotect(reinterpret_cast<void*>(page), pageLen, PROT_READ) == 0;
-}
-
 // Defined in cloud_hooks.cpp
 extern "C" {
     int hook_BYieldingSend(void* pThis, const char* methodName, void* request, void* response, int* flags);
@@ -419,52 +402,53 @@ extern "C" {
 
 bool VtableHook::InstallHooks(void** vtable, VtableInfo& info)
 {
-    info.vtable = vtable;
+    if (info.vtable) return false;
+    if (!info.protection.Capture(&vtable[5], 4 * sizeof(void*)))
+        return false;
     info.origSlot5 = vtable[5];
     info.origSlot7 = vtable[7];
     info.origSlot8 = vtable[8];
-
-    // The vtable lives in .data.rel.ro -- need to make it writable
-    void* slotBase = &vtable[5];
-    size_t span = reinterpret_cast<uintptr_t>(&vtable[8]) - reinterpret_cast<uintptr_t>(&vtable[5]) + 8;
-
-    if (!MakeWritable(slotBase, span))
-    {
+    // Record the patch before changing permissions or publishing any hook.
+    info.vtable = vtable;
+    if (!info.protection.MakeWritable()) {
         Log::Error("mprotect RW failed on vtable");
+        RemoveHooks(info);
         return false;
     }
 
-    vtable[5] = reinterpret_cast<void*>(&hook_BYieldingSend);
-    vtable[7] = reinterpret_cast<void*>(&hook_NotificationDirect);
-    vtable[8] = reinterpret_cast<void*>(&hook_SyncSend2);
-
-    // Restore read-only (non-fatal if it fails).
-    MakeReadOnly(slotBase, span);
-
+    __atomic_store_n(&vtable[5], reinterpret_cast<void*>(&hook_BYieldingSend), __ATOMIC_RELEASE);
+    __atomic_store_n(&vtable[7], reinterpret_cast<void*>(&hook_NotificationDirect), __ATOMIC_RELEASE);
+    __atomic_store_n(&vtable[8], reinterpret_cast<void*>(&hook_SyncSend2), __ATOMIC_RELEASE);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore vtable page permissions; rolling back");
+        RemoveHooks(info);
+        return false;
+    }
     Log::Info("Vtable hooks installed: slot5=%p slot7=%p slot8=%p",
               vtable[5], vtable[7], vtable[8]);
     return true;
 }
 
-void VtableHook::RemoveHooks(const VtableInfo& info)
+bool VtableHook::RemoveHooks(VtableInfo& info)
 {
-    if (!info.vtable) return;
-
-    void* slotBase = &info.vtable[5];
-    size_t span = reinterpret_cast<uintptr_t>(&info.vtable[8]) - reinterpret_cast<uintptr_t>(&info.vtable[5]) + 8;
-
-    if (MakeWritable(slotBase, span))
-    {
-        info.vtable[5] = info.origSlot5;
-        info.vtable[7] = info.origSlot7;
-        info.vtable[8] = info.origSlot8;
-        MakeReadOnly(slotBase, span);
-        Log::Info("Vtable hooks removed");
+    if (!info.vtable) return true;
+    if (!info.protection.MakeWritable()) {
+        Log::Error("mprotect RW failed during hook removal");
+        return false;
     }
-    else
-    {
-        Log::Warn("mprotect RW failed during hook removal");
+    void* expected = reinterpret_cast<void*>(&hook_BYieldingSend);
+    __atomic_compare_exchange_n(&info.vtable[5], &expected, info.origSlot5, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    expected = reinterpret_cast<void*>(&hook_NotificationDirect);
+    __atomic_compare_exchange_n(&info.vtable[7], &expected, info.origSlot7, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    expected = reinterpret_cast<void*>(&hook_SyncSend2);
+    __atomic_compare_exchange_n(&info.vtable[8], &expected, info.origSlot8, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore vtable page permissions during hook removal");
+        return false;
     }
+    info = {};
+    Log::Info("Vtable hooks removed");
+    return true;
 }
 
 static constexpr const char RTTI_REMOTE_STORAGE[] = "18CUserRemoteStorage";
@@ -736,40 +720,50 @@ void* VtableHook::FindGlobalWithVtable(void* vtablePtr,
 
 bool VtableHook::InstallCloudEnabledHook(void** vtable, CloudEnabledHookInfo& info)
 {
+    if (info.vtable) return false;
     size_t slotIndex = ResolveCloudEnabledSlot(vtable, 0, UINTPTR_MAX);
-    if (slotIndex == SIZE_MAX)
-    {
+    if (slotIndex == SIZE_MAX) {
         Log::Error("Could not resolve CUserRemoteStorage cloud-enabled slot");
         return false;
     }
-
-    info.vtable = vtable;
+    if (!info.protection.Capture(&vtable[slotIndex], sizeof(void*)))
+        return false;
     info.slotIndex = slotIndex;
     info.origSlot = vtable[slotIndex];
-
-    void* slotAddr = &vtable[slotIndex];
-    if (!MakeWritable(slotAddr, sizeof(void*)))
-    {
+    info.vtable = vtable;
+    if (!info.protection.MakeWritable()) {
         Log::Error("mprotect RW failed on RemoteStorage vtable slot %zu", slotIndex);
+        RemoveCloudEnabledHook(info);
         return false;
     }
 
-    vtable[slotIndex] = reinterpret_cast<void*>(&hook_IsCloudEnabledForApp);
-    MakeReadOnly(slotAddr, sizeof(void*));
-
+    // Calls can arrive as soon as the slot is replaced.
+    CloudHooks::SetOriginalIsCloudEnabled(info.origSlot);
+    __atomic_store_n(&vtable[slotIndex], reinterpret_cast<void*>(&hook_IsCloudEnabledForApp), __ATOMIC_RELEASE);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore RemoteStorage page permissions; rolling back");
+        RemoveCloudEnabledHook(info);
+        return false;
+    }
     Log::Info("IsCloudEnabledForApp hook installed at slot %zu (orig=%p)", slotIndex, info.origSlot);
     return true;
 }
 
-void VtableHook::RemoveCloudEnabledHook(const CloudEnabledHookInfo& info)
+bool VtableHook::RemoveCloudEnabledHook(CloudEnabledHookInfo& info)
 {
-    if (!info.vtable) return;
-
-    void* slotAddr = &info.vtable[info.slotIndex];
-    if (MakeWritable(slotAddr, sizeof(void*)))
-    {
-        info.vtable[info.slotIndex] = info.origSlot;
-        MakeReadOnly(slotAddr, sizeof(void*));
-        Log::Info("IsCloudEnabledForApp hook removed");
+    if (!info.vtable) return true;
+    if (!info.protection.MakeWritable()) {
+        Log::Error("mprotect RW failed during RemoteStorage hook removal");
+        return false;
     }
+    void* expected = reinterpret_cast<void*>(&hook_IsCloudEnabledForApp);
+    __atomic_compare_exchange_n(&info.vtable[info.slotIndex], &expected, info.origSlot, false,
+                               __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    if (!info.protection.Restore()) {
+        Log::Error("Could not restore RemoteStorage page permissions during hook removal");
+        return false;
+    }
+    info = {};
+    Log::Info("IsCloudEnabledForApp hook removed");
+    return true;
 }

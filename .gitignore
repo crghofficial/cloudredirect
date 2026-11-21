@@ -33,3 +33,8 @@ release-*/
 !tests/deployer_file_tests.cpp
 !tests/linux_preload_lifecycle_tests.cpp
 !tests/linux_external_library_tests.cpp
+
+!tests/linux_hook_lifecycle_tests.cpp
+!tests/linux_init_failure_tests.cpp
+!tests/linux_hook_dispatch_tests.cpp
+!tests/linux_inline_hook_tests.cpp

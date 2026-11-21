@@ -47,7 +47,8 @@ static std::atomic<NotificationDirect_t> g_origNotificationDirect{nullptr};
 static std::atomic<SyncSend2_t>          g_origSyncSend2{nullptr};
 
 static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_shuttingDown{false};
+// Pass through to Steam until the entry point commits startup.
+static std::atomic<bool> g_shuttingDown{true};
 static std::atomic<int>  g_hookRefCount{0};
 static std::atomic<bool> g_statsSyncEnabled{true}; // set false by config before any stats init
 
@@ -353,27 +354,30 @@ static const uint8_t* SerializeBodyTL(void* bodyObj, size_t* outLen) {
     return tlBuf.empty() ? nullptr : tlBuf.data();
 }
 
-void CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize) {
+bool CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t steamclientSize) {
 #if defined(__x86_64__)
     // Both optional observers below still describe i386 structures and emit
     // i386 detours. Cloud RPCs use the independently resolved SysV helpers.
     (void)steamclientBase;
     (void)steamclientSize;
     LOG("[GamesPlayed] x86-64 playtime observers disabled (legacy i386 ABI)");
-    return;
+    return true;
 #else
     if (!g_serializeToArray) {
         LOG("[GamesPlayed] serializer not resolved -- playtime tracking disabled");
-        return;
+        return true;
     }
 
     // Always install -- runs before config sets the toggles; per-message paths
     // already check the live toggle (matches Windows).
     GamesPlayedHook::SetSerializer(&SerializeBodyTL);
-    GamesPlayedHook::Install(steamclientBase, steamclientSize);
+    if (!GamesPlayedHook::Install(steamclientBase, steamclientSize) && !GamesPlayedHook::Remove())
+        return false;
 
-    if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray))
-        LivePlaytime::InstallUserCapture();
+    if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray) &&
+        !LivePlaytime::InstallUserCapture() && !LivePlaytime::RemoveUserCapture())
+        return false;
+    return true;
 
 #endif
 }
@@ -1028,13 +1032,17 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
     return true;
 }
 
-void CloudHooks::BeginShutdown() {
+void CloudHooks::Enable() {
+    g_shuttingDown.store(false, std::memory_order_release);
+}
+
+bool CloudHooks::BeginShutdown(bool drainPendingPlaytime) {
     g_shuttingDown.store(true, std::memory_order_release);
-    GamesPlayedHook::Remove();
-    if (g_statsSyncEnabled.load(std::memory_order_relaxed)) {
+    bool removed = GamesPlayedHook::Remove();
+    if (drainPendingPlaytime && g_statsSyncEnabled.load(std::memory_order_relaxed)) {
         LivePlaytime::DrainOnNetThread();
     }
-    LivePlaytime::RemoveUserCapture();
+    removed = LivePlaytime::RemoveUserCapture() && removed;
     for (int i = 0; i < 300 && g_hookRefCount.load(std::memory_order_acquire) > 0; ++i)
         usleep(10000); // 10ms, up to 3s total
 
@@ -1069,4 +1077,5 @@ void CloudHooks::BeginShutdown() {
             g_seedThread.detach();
         }
     }
+    return removed;
 }

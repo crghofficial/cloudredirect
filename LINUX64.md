@@ -18,6 +18,8 @@ The UI checks the library and CLI against the installed SLSsteam architecture du
 
 The x86-64 path resolves protobuf helpers and KeyValues functions through unique instruction signatures. It uses pointer-width vtables, the SysV bool/size_t calling conventions and the current CAppInfoCache tree layout. Anonymous BSS mappings are included and clipped to the ELF image boundary. Missing or ambiguous required signatures stop initialization before hook installation.
 
+Hooks pass through to Steam until initialization completes. Failed initialization disables interception and removes recorded vtable and optional observer patches. Page permissions are saved per page and restored after each patch. Cleanup failures retain their state for retry and are reported explicitly.
+
 The launcher keeps `LD_PRELOAD` for Steam's pressure-vessel handoff. A launcher that exits before mapping `steamclient.so` cancels its wait during shutdown. The x86-64 transport resolver requires a single vtable candidate with all three hook entries in executable mappings. RemoteStorage discovery accepts an existing SLSsteam entry detour.
 
 On Linux, AutoCloud looks for a Proton prefix in the library containing the game's app manifest. This covers mounted external libraries whose paths appear in `libraryfolders.vdf`. The Steam client and host CLI need access to that mount.

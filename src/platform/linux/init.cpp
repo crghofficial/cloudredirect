@@ -31,6 +31,7 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include <string>
 #include <cstdint>
 #include <pthread.h>
+#include <exception>
 
 static VtableHook::VtableInfo g_vtableInfo{};
 static VtableHook::CloudEnabledHookInfo g_cloudEnabledInfo{};
@@ -38,6 +39,7 @@ static std::atomic<bool> g_initialized{false};
 static std::atomic<bool> g_logInitialized{false};
 static pthread_t g_initThread{};
 static bool g_initThreadStarted = false;
+static bool g_hookCleanupPending = false;
 static std::atomic<bool> g_stopInit{false};
 
 // Raw diagnostic logging (survives even if C++ runtime is broken)
@@ -162,6 +164,20 @@ static void CleanLdPreload()
         setenv("LD_PRELOAD", cleaned.c_str(), 1);
 }
 
+static bool RemoveInstalledHooks(bool drainPendingPlaytime)
+{
+    bool removed = CloudHooks::BeginShutdown(drainPendingPlaytime);
+    if (g_hookCleanupPending) {
+        CloudStorage::Shutdown();
+        HttpServer::Stop();
+    }
+    removed = VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo) && removed;
+    removed = VtableHook::RemoveHooks(g_vtableInfo) && removed;
+    g_initialized.store(false, std::memory_order_release);
+    g_hookCleanupPending = !removed;
+    return removed;
+}
+
 static void DoInit()
 {
     DebugLog("[CR] DoInit: version=" CR_VERSION_STRING " finding steamclient.so in /proc/self/maps\n");
@@ -228,6 +244,7 @@ static void DoInit()
     CloudHooks::SetOriginals(vtable[5], vtable[7], vtable[8]);
 
     DebugLog("[CR] DoInit: installing transport hooks\n");
+    g_hookCleanupPending = true;
     if (!VtableHook::InstallHooks(vtable, g_vtableInfo))
     {
         DebugLog("[CR] DoInit: FAILED - hook installation failed\n");
@@ -242,11 +259,12 @@ static void DoInit()
     {
         if (VtableHook::InstallCloudEnabledHook(rsVtable, g_cloudEnabledInfo))
         {
-            CloudHooks::SetOriginalIsCloudEnabled(g_cloudEnabledInfo.origSlot);
             Log::Info("IsCloudEnabledForApp hook installed");
         }
-        else
+        else {
             Log::Warn("IsCloudEnabledForApp hook install failed (cloud toggle may not work)");
+            if (g_cloudEnabledInfo.vtable) return;
+        }
     }
     else
         Log::Warn("CUserRemoteStorage vtable not found (cloud toggle may not work)");
@@ -256,7 +274,10 @@ static void DoInit()
     // patching steamclient.so when the user doesn't want stats/achievements.
     if (pbOk && StatsSyncEnabled())
     {
-        CloudHooks::InstallGamesPlayedObserver(steamBase, steamSize);
+        if (!CloudHooks::InstallGamesPlayedObserver(steamBase, steamSize)) {
+            Log::Error("Optional observer rollback failed; aborting initialization");
+            return;
+        }
     }
     else if (pbOk)
     {
@@ -274,6 +295,9 @@ static void DoInit()
     SteamKvInjector::Init();
 #endif
 
+    if (g_stopInit.load(std::memory_order_acquire))
+        return;
+    CloudHooks::Enable();
     g_initialized.store(true, std::memory_order_release);
     DebugLog("[CR] DoInit: SUCCESS\n");
     Log::Info("CloudRedirect initialized successfully (cloud save hooks active; optional observers reported above)");
@@ -579,15 +603,26 @@ static void* DeferredInitThread(void*)
     sigaction(SIGSEGV, &sa, &old_segv);
     sigaction(SIGBUS, &sa, &old_bus);
 
-    g_inScan = 1;
-    if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
-        DoInit();
-    } else {
-        DebugLog("[CR] DeferredInit: CRASHED during init, aborting safely\n");
-        Log::Error("Caught signal during init - incompatible steamclient? Hooks NOT installed.");
-        Notify("Crashed during init - hooks disabled", true);
+    bool failed = false;
+    try {
+        if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+            g_inScan = 1;
+            DoInit();
+        } else {
+            DebugLog("[CR] DeferredInit: signal during init\n");
+            Log::Error("Caught signal during initialization");
+            failed = true;
+        }
+    } catch (const std::exception& error) {
+        Log::Error("Initialization failed: %s", error.what());
+        failed = true;
+    } catch (...) {
+        Log::Error("Initialization failed with an unknown exception");
+        failed = true;
     }
     g_inScan = 0;
+    if (failed)
+        g_initialized.store(false, std::memory_order_release);
 
     // Restore original handlers and install crash dump handler if init succeeded
     sigaction(SIGSEGV, &old_segv, nullptr);
@@ -595,6 +630,14 @@ static void* DeferredInitThread(void*)
 
     if (g_initialized.load(std::memory_order_acquire)) {
         InstallCrashDumpHandler();
+    } else {
+        if (RemoveInstalledHooks(false)) {
+            Log::Warn("Initialization incomplete; hooks removed and page permissions restored");
+            if (failed) Notify("Initialization failed - hooks removed", true);
+        } else {
+            Log::Error("Initialization incomplete; hook rollback failed, interception disabled");
+            Notify("Initialization failed - rollback incomplete, restart Steam", true);
+        }
     }
 
     return nullptr;
@@ -626,19 +669,21 @@ static void OnUnload()
     if (g_initThreadStarted) {
         g_stopInit.store(true, std::memory_order_release);
         pthread_join(g_initThread, nullptr);
+        g_initThreadStarted = false;
     }
 
-    if (g_initialized.load(std::memory_order_acquire))
+    const bool initialized = g_initialized.load(std::memory_order_acquire);
+    if (initialized || g_hookCleanupPending)
     {
-        CloudIntercept::FlushPendingSyncStates();
-        CloudStorage::Shutdown();
-        HttpServer::Stop();
-        CloudHooks::BeginShutdown();
-        VtableHook::RemoveHooks(g_vtableInfo);
-        VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo);
-        Log::Info("cloud_redirect.so unloaded");
+        if (initialized) CloudIntercept::FlushPendingSyncStates();
+        if (RemoveInstalledHooks(initialized))
+            Log::Info("cloud_redirect.so unloaded");
+        else
+            Log::Error("Hook cleanup incomplete during unload");
     }
-    if (g_debugFd >= 0)
+    if (g_debugFd >= 0) {
         close(g_debugFd);
+        g_debugFd = -1;
+    }
 }
 

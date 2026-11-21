@@ -566,8 +566,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
     set_tests_properties(linux_preload_lifecycle_tests PROPERTIES TIMEOUT 4)
 endif()
 
-# AutoCloud library selection also runs in the legacy client.
+# Hook lifecycle and AutoCloud library selection run in both client architectures.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (NOT LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
+    foreach(test IN ITEMS linux_hook_lifecycle_tests linux_init_failure_tests)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/platform/linux)
+        target_compile_definitions(${test} PRIVATE CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+        target_link_libraries(${test} PRIVATE dl pthread)
+    endforeach()
+    foreach(test IN ITEMS linux_hook_dispatch_tests linux_inline_hook_tests)
+        add_executable(${test} tests/${test}.cpp)
+        target_include_directories(${test} PRIVATE src/common src/platform/linux)
+        target_compile_options(${test} PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(${test} PRIVATE -Wl,--gc-sections)
+        target_link_libraries(${test} PRIVATE pthread dl)
+        add_test(NAME ${test} COMMAND ${test})
+    endforeach()
+    target_sources(linux_hook_lifecycle_tests PRIVATE src/platform/linux/log.cpp)
+    target_link_options(linux_hook_lifecycle_tests PRIVATE -Wl,--wrap=mprotect)
+    foreach(scenario IN ITEMS success failed-install failed-seal failed-remove failed-remove-seal other-hook)
+        add_test(NAME linux_hook_${scenario} COMMAND linux_hook_lifecycle_tests ${scenario})
+    endforeach()
+    foreach(stage RANGE 0 8)
+        add_test(NAME linux_init_failure_${stage} COMMAND linux_init_failure_tests ${stage})
+    endforeach()
     add_executable(linux_external_library_tests tests/linux_external_library_tests.cpp
         src/common/autocloud_scan.cpp src/common/vdf.cpp
         src/platform/linux/platform_linux.cpp src/platform/linux/log.cpp)

@@ -54,7 +54,7 @@ Page {
                 spacing: 2
                 Layout.leftMargin: 12
 
-                Label { text: "• CloudRedirect from Steam (LD_AUDIT hook)"; opacity: 0.8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Label { text: "• CloudRedirect from Steam (LD_PRELOAD)"; opacity: 0.8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 Label { text: "• cloud_redirect.so and CLI binary"; opacity: 0.8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 Label { text: "• All configuration and settings"; opacity: 0.8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 Label { text: "• OAuth tokens (Google Drive / OneDrive)"; opacity: 0.8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
@@ -175,7 +175,7 @@ Page {
                             if (!deployer) return "Unknown"
                             if (!deployer.alreadyDeployed) return "Not deployed"
                             if (deployer.updateAvailable) return "Update available"
-                            return "Deployed, up to date"
+                            return deployer.launcherConfigured ? "Steam launcher configured" : "Files installed"
                         }
                         opacity: 0.7
                     }
@@ -217,6 +217,12 @@ Page {
                     visible: deployer && deployer.updateAvailable
                     highlighted: true
                     onClicked: { if (deployer) deployer.update() }
+                }
+
+                Button {
+                    text: "Repair Steam Launcher"
+                    visible: deployer && deployer.launcherRepairAvailable
+                    onClicked: { if (deployer) deployer.repairLauncher() }
                 }
 
                 Button {

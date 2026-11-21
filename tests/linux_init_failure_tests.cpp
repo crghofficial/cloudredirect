@@ -153,7 +153,12 @@ int main(int argc, char** argv) {
     sigemptyset(&previous.sa_mask);
     sigaction(SIGSEGV, &previous, nullptr);
     sigaction(SIGBUS, &previous, nullptr);
+    // The runtime child drops only its own preload, including symlink aliases.
+    setenv("LD_PRELOAD", "/proc/self/exe:/keep/cloud_redirect-extra.so third-party.so", 1);
     DeferredInitThread(nullptr);
+    const char* preload = getenv("LD_PRELOAD");
+    if (!preload || strcmp(preload, "/keep/cloud_redirect-extra.so:third-party.so") != 0)
+        return 9;
     struct sigaction restoredSegv{}, restoredBus{};
     sigaction(SIGSEGV, nullptr, &restoredSegv);
     sigaction(SIGBUS, nullptr, &restoredBus);

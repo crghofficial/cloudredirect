@@ -1,6 +1,7 @@
 #include "deployer.h"
 #include "utils.h"
 #include "native_binary.h"
+#include "steam_launcher.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -157,26 +158,35 @@ void Deployer::checkPrerequisites()
     m_alreadyDeployed = NativeBinary::compatible(m_soDeployPath, slsDir + "/SLSsteam.so");
 
     m_headcrabInstalled = false;
-    QString steamSh;
-    QString shPath1 = home + "/.local/share/Steam/steam.sh";
-    QString shPath2 = home + "/.steam/steam/steam.sh";
-    QString shPath3 = home + "/.var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh";
-    if (QFile::exists(shPath1))
-        steamSh = shPath1;
-    else if (QFile::exists(shPath2))
-        steamSh = shPath2;
-    else if (QFile::exists(shPath3))
-        steamSh = shPath3;
-
-    if (!steamSh.isEmpty()) {
-        QFile f(steamSh);
-        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QString content = f.readAll();
-            f.close();
-            if (content.contains("LD_AUDIT") && content.contains("SLSsteam.so"))
-                m_headcrabInstalled = true;
+    m_launcherPath.clear();
+    QStringList nativeLaunchers;
+    QString singleLauncher;
+    const QStringList steamPaths = {
+        home + "/.steam/steam/steam.sh",
+        home + "/.local/share/Steam/steam.sh",
+        xdgDataHome() + "/Steam/steam.sh",
+        home + "/.var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh",
+    };
+    for (qsizetype i = 0; i < steamPaths.size(); ++i) {
+        QFile f(steamPaths[i]);
+        if (!QFileInfo(f).isFile() || !f.open(QIODevice::ReadOnly) || f.size() > 256 * 1024)
+            continue;
+        const auto content = f.readAll();
+        if (content.contains("LD_AUDIT") && content.contains("SLSsteam.so"))
+            m_headcrabInstalled = true;
+        if (i < steamPaths.size() - 1) {
+            const auto path = QFileInfo(f).canonicalFilePath();
+            if (!path.isEmpty() && !nativeLaunchers.contains(path)) {
+                nativeLaunchers.append(path);
+                singleLauncher = steamPaths[i];
+            }
         }
     }
+    if (nativeLaunchers.size() == 1)
+        m_launcherPath = singleLauncher;
+    const auto launcher = SteamLauncher::inspect(m_launcherPath, m_soDeployPath);
+    m_launcherConfigured = launcher == SteamLauncher::State::Configured;
+    m_launcherRepairAvailable = m_alreadyDeployed && launcher == SteamLauncher::State::NeedsRepair;
 
     m_updateAvailable = false;
     m_bundledVersion = getSoVersion(m_soSourcePath);
@@ -211,8 +221,12 @@ void Deployer::checkPrerequisites()
         m_statusMessage = "The installed CLI is missing or incompatible. Reinstall the matching CLI from the bundle.";
     } else if (m_updateAvailable) {
         m_statusMessage = "Update available. A newer version is bundled with this app.";
+    } else if (m_launcherRepairAvailable) {
+        m_statusMessage = "Files installed. Use Repair Steam Launcher to configure automatic loading.";
+    } else if (m_alreadyDeployed && m_launcherConfigured) {
+        m_statusMessage = "Steam launcher configured. Restart Steam to load CloudRedirect.";
     } else if (m_alreadyDeployed) {
-        m_statusMessage = "CloudRedirect is deployed. Restart Steam to load it.";
+        m_statusMessage = "Files installed. Automatic loading could not be verified for this Steam launcher.";
     } else if (m_soSourcePath.isEmpty()) {
         m_statusMessage = "cloud_redirect.so not found. Installation may be corrupted.";
     } else {
@@ -273,11 +287,11 @@ bool Deployer::deploy()
     QString configDir = crConfigDir();
     QDir().mkpath(configDir);
 
-    m_statusMessage = "CloudRedirect deployed to " + crDataDir() + ". Restart Steam to activate.";
+    const bool configured = configureLauncher();
     emit statusMessageChanged();
     emit checkCompleted();
-    emit deployCompleted(true);
-    return true;
+    emit deployCompleted(configured);
+    return configured;
 }
 
 bool Deployer::update()
@@ -287,19 +301,57 @@ bool Deployer::update()
         return false;
     }
 
-    m_statusMessage = "Updated successfully. Restart Steam to use the new version.";
+    const bool configured = configureLauncher();
     emit statusMessageChanged();
     emit checkCompleted();
-    return true;
+    return configured;
+}
+
+bool Deployer::configureLauncher()
+{
+    const auto state = SteamLauncher::inspect(m_launcherPath, m_soDeployPath);
+    if (state == SteamLauncher::State::Unsupported) {
+        m_launcherConfigured = false;
+        m_launcherRepairAvailable = false;
+        m_statusMessage = "Files installed. Automatic loading could not be verified for this Steam launcher.";
+        return true;
+    }
+    m_launcherConfigured = SteamLauncher::repair(m_launcherPath, m_soDeployPath);
+    m_launcherRepairAvailable = !m_launcherConfigured;
+    m_statusMessage = m_launcherConfigured
+        ? "Steam launcher configured. Restart Steam to load CloudRedirect."
+        : "Files installed, but the Steam launcher could not be updated. Check its directory and retry.";
+    return m_launcherConfigured;
+}
+
+bool Deployer::repairLauncher()
+{
+    checkPrerequisites();
+    if (!m_launcherRepairAvailable)
+        return false;
+    const bool ok = configureLauncher();
+    emit statusMessageChanged();
+    emit checkCompleted();
+    return ok;
 }
 
 bool Deployer::undeploy()
 {
-    if (QFile::exists(m_soDeployPath))
-        QFile::remove(m_soDeployPath);
-    if (QFile::exists(m_cliDeployPath))
-        QFile::remove(m_cliDeployPath);
+    if (!SteamLauncher::remove(m_launcherPath, m_soDeployPath)) {
+        m_statusMessage = "The managed Steam launcher change could not be removed.";
+        emit statusMessageChanged();
+        return false;
+    }
+    if ((QFile::exists(m_soDeployPath) && !QFile::remove(m_soDeployPath)) ||
+        (QFile::exists(m_cliDeployPath) && !QFile::remove(m_cliDeployPath))) {
+        checkPrerequisites();
+        m_statusMessage = "Could not remove all CloudRedirect files. Check directory permissions and retry.";
+        emit statusMessageChanged();
+        return false;
+    }
 
+    m_launcherConfigured = false;
+    m_launcherRepairAvailable = false;
     m_alreadyDeployed = false;
     m_updateAvailable = false;
     m_deployedVersion.clear();
@@ -311,7 +363,8 @@ bool Deployer::undeploy()
 
 bool Deployer::purgeAll()
 {
-    undeploy();
+    if (!undeploy())
+        return false;
 
     QString configDir = crConfigDir();
     QDir configQDir(configDir);

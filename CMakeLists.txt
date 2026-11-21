@@ -514,7 +514,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT LI
         target_include_directories(native_binary_tests PRIVATE ui-linux/src)
         target_link_libraries(native_binary_tests PRIVATE Qt6::Core)
         add_test(NAME native_binary_tests COMMAND native_binary_tests)
-        add_executable(deployer_file_tests tests/deployer_file_tests.cpp ui-linux/src/deployer.cpp)
+        add_executable(deployer_file_tests
+            tests/deployer_file_tests.cpp
+            ui-linux/src/deployer.cpp
+            ui-linux/src/steam_launcher.cpp)
         set_target_properties(deployer_file_tests PROPERTIES AUTOMOC ON)
         target_include_directories(deployer_file_tests PRIVATE ui-linux/src)
         target_link_libraries(deployer_file_tests PRIVATE Qt6::Core)

@@ -14,6 +14,12 @@ Run `scripts/stage-flatpak.sh` after the isolated build. It validates both ELF f
 
 The UI checks the library and CLI against the installed SLSsteam architecture during deployment and updates. Deployment status describes the installed files. Hook initialization is reported by Steam at startup. Native file replacements use atomic per-file commits.
 
+## Steam launcher
+
+The Setup page installs the library and CLI, then configures automatic loading for recognized native Headcrab wrappers. **Repair Steam Launcher** adds the preload to an existing installation, or restores it after Headcrab replaces the wrapper. Setup distinguishes installed files from a configured launcher. Configuration can be confirmed by restarting Steam and checking that its client process maps both CloudRedirect and SLSsteam.
+
+Headcrab selects its CloudRedirect wrapper when the installer finds the literal setting `DisableCloud: no`. Its regular wrapper exports `LD_AUDIT` for SLSsteam and does not set `LD_PRELOAD`. Either wrapper can be present with matching CloudRedirect files on disk. The managed change preserves the incoming preload list and the Headcrab audit settings, and is removed when CloudRedirect is undeployed. Steam's `client.sh` is left to Valve and Headcrab. If an update replaces the wrapper, run Refresh in Setup and use Repair Steam Launcher if offered. Unknown or custom launchers and a Steam installation inside the Steam Flatpak retain their own launch integration.
+
 ## Runtime changes
 
 The x86-64 path resolves protobuf helpers and KeyValues functions through unique instruction signatures. It uses pointer-width vtables, the SysV bool/size_t calling conventions and the current CAppInfoCache tree layout. Anonymous BSS mappings are included and clipped to the ELF image boundary. Missing or ambiguous required signatures stop initialization before hook installation.
@@ -44,4 +50,4 @@ These probes passed against Steam builds 1792618285 and 1794536281. The protobuf
 
 On Arch Linux, a Gamescope 3.17 session with and without Steam integration started an isolated Steam Runtime 4 container and ran the matching CLI. The compositor exited abnormally after the child finished, including in control runs without the preload. This does not establish the cause of the SteamOS report.
 
-Earlier live validation on 1792618285 with SLSsteam confirmed five downloads and an upload. Live sync on 1794536281, SteamOS Gaming Mode and a legacy i386 Steam session still need testing. The Flatpak preview was installed and launched in isolation. Future clients may need ABI verification when Valve changes internal layouts.
+Earlier live validation on 1792618285 with SLSsteam confirmed five downloads and an upload. A Lenovo Legion Go S user reported that a manual preload reached the client in SteamOS Desktop and Gaming Mode, including after reboot. The managed launcher change still needs an on-device check. Live sync on 1794536281 and a legacy i386 Steam session also still need testing. [Device report](https://github.com/crghofficial/cloudredirect/issues/5#issuecomment-7062676468) The Flatpak preview was installed and launched in isolation. Future clients may need ABI verification when Valve changes internal layouts.

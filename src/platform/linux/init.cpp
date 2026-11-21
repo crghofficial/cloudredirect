@@ -21,6 +21,7 @@ const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <ucontext.h>
@@ -143,6 +144,10 @@ static void CleanLdPreload()
     char* preload = getenv("LD_PRELOAD");
     if (!preload) return;
 
+    Dl_info library{};
+    struct stat loaded{};
+    const bool haveIdentity = dladdr(reinterpret_cast<const void*>(&CleanLdPreload), &library) &&
+        library.dli_fname && stat(library.dli_fname, &loaded) == 0;
     std::string val(preload);
     std::string cleaned;
     size_t pos = 0;
@@ -151,7 +156,11 @@ static void CleanLdPreload()
         size_t sep = val.find_first_of(": ", pos);
         if (sep == std::string::npos) sep = val.size();
         std::string entry = val.substr(pos, sep - pos);
-        if (!entry.empty() && entry.find("cloud_redirect") == std::string::npos)
+        struct stat candidate{};
+        const bool isCloudRedirect = entry == "cloud_redirect.so" ||
+            (haveIdentity && !entry.empty() && stat(entry.c_str(), &candidate) == 0 &&
+             candidate.st_dev == loaded.st_dev && candidate.st_ino == loaded.st_ino);
+        if (!entry.empty() && !isCloudRedirect)
         {
             if (!cleaned.empty()) cleaned += ':';
             cleaned += entry;
